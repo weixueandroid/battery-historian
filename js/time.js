@@ -22,6 +22,10 @@ goog.provide('historian.time');
 
 
 /** @const {number} */
+historian.time.NANOSECS_IN_MSEC = 1000000;
+
+
+/** @const {number} */
 historian.time.MSECS_IN_SEC = 1000;
 
 
@@ -51,20 +55,24 @@ historian.time.NSECS_IN_MSEC = 1000000;
 
 /**
  * Returns the date formatted in "Month Day Year".
- * @param {number} t The unix timestamp to format.
+ * @param {number} t The unix timestamp to format in milliseconds.
+ * @param {string} loc The IANA time zone location.
  * @return {string} The formatted date "Month Day Year".
  */
-historian.time.getDate = function(t) {
-  var d = new Date(t);
+historian.time.getDate = function(t, loc) {
+  var m = moment.unix(t / 1000);
+  if (loc) {
+    m = m.tz(loc);
+  }
   var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
                 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  return months[d.getMonth()] + ' ' + d.getDate() + ' ' + d.getFullYear();
+  return months[m.month()] + ' ' + m.date() + ' ' + m.year();
 };
 
 
 /**
  * Returns the time formatted in 'HH:mm:ss' (24 hour time).
- * @param {number} t The unix timestamp to format.
+ * @param {number} t The unix timestamp to format in milliseconds.
  * @param {string} loc The IANA time zone location.
  * @return {string} The formatted time 'hh:mm:ss'.
  */
@@ -74,6 +82,17 @@ historian.time.getTime = function(t, loc) {
     m = m.tz(loc);
   }
   return m.format('HH:mm:ss');
+};
+
+
+/**
+ * Returns the time zone in the short format. e.g. PDT UTC-07:00
+ * @param {number} t The unix timestamp.
+ * @param {string} loc The IANA time zone location.
+ * @return {string} The time zone in the short format.
+ */
+historian.time.getTimeZoneShort = function(t, loc) {
+  return moment(t).tz(loc).format('z UTCZ');
 };
 
 

@@ -29,7 +29,7 @@ var mockmatchers = goog.require('goog.testing.mockmatchers');
 var testSuite = goog.require('goog.testing.testSuite');
 
 
-var mockControl_;
+var mockControl;
 
 var overlay;
 var mockLevelData;
@@ -46,133 +46,133 @@ var mockGetSelected;
 testSuite({
 
   setUp: function() {
-    mockControl_ = new MockControl();
+    mockControl = new MockControl();
 
     // Mock UI functions.
-    mockControl_.createMethodMock(Overlay.prototype, 'renderSelector_')();
-    mockClear = mockControl_.createMethodMock(Overlay.prototype, 'clear_');
-    mockDraw = mockControl_.createMethodMock(Overlay.prototype, 'draw_');
+    mockControl.createMethodMock(Overlay.prototype, 'renderSelector_')();
+    mockClear = mockControl.createMethodMock(Overlay.prototype, 'clear_');
+    mockDraw = mockControl.createMethodMock(Overlay.prototype, 'draw_');
     mockShowSelector =
-        mockControl_.createMethodMock(Overlay.prototype, 'showSelector_');
+        mockControl.createMethodMock(Overlay.prototype, 'showSelector_');
     mockGetSelected =
-        mockControl_.createMethodMock(Overlay.prototype, 'getSelected_');
+        mockControl.createMethodMock(Overlay.prototype, 'getSelected_');
 
     // Mock power estimator.
-    mockContext = mockControl_.createStrictMock(Context);
-    mockLevelData = mockControl_.createStrictMock(LevelData);
+    mockContext = mockControl.createStrictMock(Context);
+    mockLevelData = mockControl.createStrictMock(LevelData);
     mockLevelData.registerListener(mockmatchers.isFunction);
-    mockEstimator = mockControl_.createStrictMock(Estimator);
-    mockControl_.$replayAll();
+    mockEstimator = mockControl.createStrictMock(Estimator);
+    mockControl.$replayAll();
 
     overlay = new Overlay(mockContext, mockLevelData, mockEstimator);
 
-    mockControl_.$verifyAll();
-    mockControl_.$resetAll();
+    mockControl.$verifyAll();
+    mockControl.$resetAll();
   },
 
   tearDown: function() {
-    mockControl_.$tearDown();
+    mockControl.$tearDown();
   },
 
   /**
-   * Tests rendering if powermonitor is the current level line overlay, and no
+   * Tests rendering if power monitor is the current level line overlay, and no
    * wakeup reason has been selected.
    */
-  testPowermonitorOverlaidNoneSelected: function() {
+  testPowerMonitorOverlaidNoneSelected: function() {
     mockClear();
-    mockLevelData.getConfig().$returns({name: Csv.POWERMONITOR});
+    mockLevelData.getConfig().$returns({name: Csv.POWER_MONITOR});
     mockGetSelected().$returns('');
     mockShowSelector(true);
-    mockControl_.$replayAll();
+    mockControl.$replayAll();
 
     overlay.render();
-    mockControl_.$verifyAll();
+    mockControl.$verifyAll();
   },
 
   /**
-   * Tests rendering if powermonitor is the current level line overlay, and
+   * Tests rendering if power monitor is the current level line overlay, and
    * the selected wakeup reason has no events.
    */
-  testPowermonitorOverlaidSelectedWithNoEvents: function() {
+  testPowerMonitorOverlaidSelectedWithNoEvents: function() {
     mockClear();
-    mockLevelData.getConfig().$returns({name: Csv.POWERMONITOR});
+    mockLevelData.getConfig().$returns({name: Csv.POWER_MONITOR});
     mockGetSelected().$returns('wake_reason');
     mockShowSelector(true);
     mockContext.msPerPixel().$returns(10);
     mockEstimator.getEvents('wake_reason').$returns([]);
-    mockControl_.$replayAll();
+    mockControl.$replayAll();
 
     overlay.render();
-    mockControl_.$verifyAll();
+    mockControl.$verifyAll();
   },
 
   /**
-   * Tests rendering if powermonitor is the current level line overlay, and
+   * Tests rendering if power monitor is the current level line overlay, and
    * the current view is zoomed in (msPerPixel is small).
    */
-  testPowermonitorOverlaidZoomedIn: function() {
+  testPowerMonitorOverlaidZoomedIn: function() {
     mockClear();
-    mockLevelData.getConfig().$returns({name: Csv.POWERMONITOR});
+    mockLevelData.getConfig().$returns({name: Csv.POWER_MONITOR});
     mockGetSelected().$returns('wake_reason');
     mockShowSelector(true);
     mockContext.msPerPixel().$returns(10);
 
-    var mockPowerEvent1 = mockControl_.createStrictMock(Event);
-    var powermonitorEvents1 = [{startTime: 1000}, {startTime: 2000}];
-    mockPowerEvent1.getPowermonitorEvents().$returns(powermonitorEvents1);
+    var mockPowerEvent1 = mockControl.createStrictMock(Event);
+    var powerMonitorEvents1 = [{startTime: 1000}, {startTime: 2000}];
+    mockPowerEvent1.getPowerMonitorEvents().$returns(powerMonitorEvents1);
 
-    var mockPowerEvent2 = mockControl_.createStrictMock(Event);
-    var powermonitorEvents2 = [{startTime: 300}];
-    mockPowerEvent2.getPowermonitorEvents().$returns(powermonitorEvents2);
+    var mockPowerEvent2 = mockControl.createStrictMock(Event);
+    var powerMonitorEvents2 = [{startTime: 300}];
+    mockPowerEvent2.getPowerMonitorEvents().$returns(powerMonitorEvents2);
 
     mockEstimator.getEvents('wake_reason')
         .$returns([mockPowerEvent1, mockPowerEvent2]);
-    mockDraw(powermonitorEvents1);
-    mockDraw(powermonitorEvents2);
-    mockControl_.$replayAll();
+    mockDraw(powerMonitorEvents1);
+    mockDraw(powerMonitorEvents2);
+    mockControl.$replayAll();
 
     overlay.render();
-    mockControl_.$verifyAll();
+    mockControl.$verifyAll();
 
   },
 
   /**
-   * Tests rendering if powermonitor is the current level line overlay, and
+   * Tests rendering if power monitor is the current level line overlay, and
    * the current view is zoomed out (msPerPixel is large).
    */
-  testPowermonitorOverlaidZoomedOut: function() {
+  testPowerMonitorOverlaidZoomedOut: function() {
     mockClear();
-    mockLevelData.getConfig().$returns({name: Csv.POWERMONITOR});
+    mockLevelData.getConfig().$returns({name: Csv.POWER_MONITOR});
     mockGetSelected().$returns('wake_reason');
     mockShowSelector(true);
     mockContext.msPerPixel().$returns(2000);
 
-    var mockPowerEvent = mockControl_.createStrictMock(Event);
-    var powermonitorEvents = [{startTime: 1000}, {startTime: 1100}];
-    mockPowerEvent.getPowermonitorEvents().$returns(powermonitorEvents);
+    var mockPowerEvent = mockControl.createStrictMock(Event);
+    var powerMonitorEvents = [{startTime: 1000}, {startTime: 1100}];
+    mockPowerEvent.getPowerMonitorEvents().$returns(powerMonitorEvents);
 
     mockEstimator.getEvents('wake_reason').$returns([mockPowerEvent]);
     var sampled = [{startTime: 1000}];
-    var sampleMock = mockControl_.createMethodMock(data, 'sampleData');
-    sampleMock(powermonitorEvents).$returns(sampled);
+    var sampleMock = mockControl.createMethodMock(data, 'sampleData');
+    sampleMock(powerMonitorEvents).$returns(sampled);
     mockDraw(sampled);
-    mockControl_.$replayAll();
+    mockControl.$replayAll();
 
     overlay.render();
-    mockControl_.$verifyAll();
+    mockControl.$verifyAll();
   },
 
   /**
-   * Tests rendering if powermonitor is not the current level line overlay.
+   * Tests rendering if power monitor is not the current level line overlay.
    */
   testOtherOverlaid: function() {
     mockClear();
     mockLevelData.getConfig().$returns({name: Csv.BATTERY_LEVEL});
     mockGetSelected().$returns('');
     mockShowSelector(false);
-    mockControl_.$replayAll();
+    mockControl.$replayAll();
 
     overlay.render();
-    mockControl_.$verifyAll();
+    mockControl.$verifyAll();
   }
 });

@@ -18,6 +18,13 @@ goog.module('historian.constants');
 goog.module.declareLegacyNamespace();
 
 
+/** @enum {string} */
+exports.Elements = {
+  // Dropdown for selecting a level metric to overlay.
+  LEVEL_SELECT: '.line-overlay-metrics'
+};
+
+
 /**
  * @const {number}
  */
@@ -41,3 +48,10 @@ exports.NUM_SCREEN_DIMENSIONS = 2;
  * @const {number}
  */
 exports.TRANSITION_DURATION = 250;
+
+
+/**
+ * Unknown start or end time for an event.
+ * @const {number}
+ */
+exports.UNKNOWN_TIME = -1;

@@ -17,8 +17,10 @@ package csv
 
 import (
 	"bytes"
+	"encoding/csv"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 )
 
@@ -46,6 +48,68 @@ type Entry struct {
 	// Currently this is used to hold the UID (string) of a service (ServiceUID),
 	// and is an empty string for other types.
 	Opt string
+
+	// Unique identifier for the event. e.g. The name of the app that triggered the event.
+	Identifier string
+}
+
+// Functions expected by the EntryState interface.
+
+// GetStartTime returns the start time of the entry.
+func (e *Entry) GetStartTime() int64 {
+	return e.Start
+}
+
+// GetType returns the type of the entry.
+func (e *Entry) GetType() string {
+	return e.Type
+}
+
+// GetValue returns the stored value of the entry.
+func (e *Entry) GetValue() string {
+	return e.Value
+}
+
+// GetKey returns the unique identifier for the entry.
+func (e *Entry) GetKey(desc string) Key {
+	return Key{
+		Metric:     desc,
+		Identifier: e.Identifier,
+	}
+}
+
+// StartEvent marks an event as beginning at the given timestamp.
+// Does nothing if the event is already active.
+// For events without a duration, PrintInstantEvent should be used instead.
+func (s *State) StartEvent(e Entry) {
+	if s.HasEvent(e.Desc, e.Identifier) {
+		return
+	}
+	s.AddEntryWithOpt(e.Desc, &e, e.Start, e.Opt)
+}
+
+// HasEvent returns whether an event for the metric with the given identifier is currently active.
+func (s *State) HasEvent(metric, eventIdentifier string) bool {
+	k := Key{
+		Metric:     metric,
+		Identifier: eventIdentifier,
+	}
+	_, ok := s.entries[k]
+	return ok
+}
+
+// EndEvent marks an event as finished at the given timestamp.
+// Does nothing if the event is not currently active.
+func (s *State) EndEvent(metric, eventIdentifier string, curTime int64) {
+	if !s.HasEvent(metric, eventIdentifier) {
+		return
+	}
+	e := Entry{
+		Desc:       metric,
+		Start:      curTime,
+		Identifier: eventIdentifier,
+	}
+	s.AddEntry(metric, &e, curTime)
 }
 
 // RunningEvent contains the details required for printing a running event.
@@ -54,10 +118,15 @@ type RunningEvent struct {
 	end int64
 }
 
+type wakeupReason struct {
+	name  string
+	start int64
+}
+
 // State holds the csv writer, and the map from metric key to active entry.
 type State struct {
-	// For printing the CSV entries to.
-	writer io.Writer
+	// For printing the CSV entries.
+	writer *csv.Writer
 
 	entries map[Key]Entry
 
@@ -66,8 +135,12 @@ type State struct {
 	runningEvent *RunningEvent
 
 	// For storing the wakeup reasons for the current running event. Running events never overlap.
-	// This is stored separately to the running event as wakeup reasons can arrive after the running event ends, or before the running event if the first seen running transition is negative.
+	// This is stored separately to the running event as wakeup reasons can arrive after the running
+	// event ends, or before the running event if the first seen running transition is negative.
 	wakeupReasonBuf bytes.Buffer
+
+	// The current wakeup reason, if there is one; nil if not.
+	curWakeupReason *wakeupReason
 
 	rebootEvent *Entry
 }
@@ -84,7 +157,7 @@ func NewState(csvWriter io.Writer, printHeader bool) *State {
 		fmt.Fprintln(csvWriter, FileHeader)
 	}
 	return &State{
-		writer:  csvWriter,
+		writer:  csv.NewWriter(csvWriter),
 		entries: make(map[Key]Entry),
 	}
 }
@@ -98,11 +171,10 @@ func (s *State) HasRebootEvent() bool {
 // using the given curTime as the start time.
 func (s *State) AddRebootEvent(curTime int64) {
 	s.rebootEvent = &Entry{
-		Reboot,
-		curTime,
-		"bool",
-		"true",
-		"",
+		Desc:  Reboot,
+		Start: curTime,
+		Type:  "bool",
+		Value: "true",
 	}
 }
 
@@ -110,7 +182,7 @@ func (s *State) AddRebootEvent(curTime int64) {
 // using the given curTime as the end time.
 func (s *State) PrintRebootEvent(curTime int64) {
 	if e := s.rebootEvent; e != nil {
-		s.print(e.Desc, e.Type, e.Start, curTime, e.Value, e.Opt)
+		s.Print(e.Desc, e.Type, e.Start, curTime, e.Value, e.Opt)
 		s.rebootEvent = nil
 	}
 }
@@ -132,7 +204,7 @@ func (s *State) AddEntryWithOpt(desc string, newState EntryState, curTime int64,
 			// This is because wake up reasons can arrive after the running event ends.
 			s.assignRunningEvent(&RunningEvent{e, curTime})
 		} else {
-			s.print(e.Desc, e.Type, e.Start, curTime, e.Value, e.Opt)
+			s.Print(e.Desc, e.Type, e.Start, curTime, e.Value, e.Opt)
 		}
 		delete(s.entries, key)
 		return
@@ -146,11 +218,11 @@ func (s *State) AddEntryWithOpt(desc string, newState EntryState, curTime int64,
 		s.assignRunningEvent(nil)
 	}
 	s.entries[key] = Entry{
-		desc,
-		curTime,
-		newState.GetType(),
-		newState.GetValue(),
-		opt,
+		Desc:  desc,
+		Start: curTime,
+		Type:  newState.GetType(),
+		Value: newState.GetValue(),
+		Opt:   opt,
 	}
 }
 
@@ -164,15 +236,41 @@ func (s *State) AddOptToEntry(desc string, state EntryState, opt string) {
 	}
 }
 
-func (s *State) print(desc, metricType string, start, end int64, value, opt string) {
-	if s.writer != nil {
-		fmt.Fprintf(s.writer, "%s,%s,%d,%d,%s,%s\n", desc, metricType, start, end, value, opt)
+// stripQuotes removes the first and last quote in the string if both are present.
+// e.g. `"com.google.android.gm"` would become `com.google.android.gm`.
+func stripQuotes(value string) string {
+	// Only remove if both beginning and ending quotes are present,
+	// to avoid removing it in strings such as: TYPE_WIFI:"CONNECTED".
+	if l := len(value); l >= 2 && strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`) {
+		return value[1 : l-1]
 	}
+	return value
+}
+
+// Print directly prints a csv entry to CSV format and writes it to the writer.
+func (s *State) Print(desc, metricType string, start, end int64, value, opt string) {
+	if s.writer == nil {
+		return
+	}
+	// Strip first and last quote if present. The CSV library will escape any double quotes,
+	// leading to strings like `""com.google.android.gm""`.
+	// If any quotes are in the middle of the string we still want them escaped.
+	// Previously we were just calling Printf and did not escape the quotes, leading to the
+	// CSV parsing on the JS side to treat the quotes as a text qualifier rather than part of the value.
+	value = stripQuotes(value)
+	opt = stripQuotes(opt)
+	s.writer.Write([]string{desc, metricType, strconv.FormatInt(start, 10), strconv.FormatInt(end, 10), value, opt})
+	s.writer.Flush()
+}
+
+// PrintEvent writes an event extracted by ExtractEvents to the writer.
+func (s *State) PrintEvent(metric string, e Event) {
+	s.Print(metric, e.Type, e.Start, e.End, e.Value, e.Opt)
 }
 
 // PrintInstantEvent converts the given data to CSV format and writes it to the writer.
 func (s *State) PrintInstantEvent(e Entry) {
-	s.print(e.Desc, e.Type, e.Start, e.Start, e.Value, e.Opt)
+	s.Print(e.Desc, e.Type, e.Start, e.Start, e.Value, e.Opt)
 }
 
 // assignRunningEvent replaces the previous running event with the given one.
@@ -183,38 +281,76 @@ func (s *State) assignRunningEvent(newEvent *RunningEvent) {
 		e := s.runningEvent.e
 		e.Value = s.wakeupReasons(s.runningEvent.end)
 		s.wakeupReasonBuf.Reset()
-		s.print(e.Desc, e.Type, e.Start, s.runningEvent.end, e.Value, e.Opt)
+		s.Print(e.Desc, e.Type, e.Start, s.runningEvent.end, e.Value, e.Opt)
 	}
 	s.runningEvent = newEvent
 }
 
-// AddWakeupReason adds the wakeup reason to the wakeup reason buffer.
-func (s *State) AddWakeupReason(service string, curTime int64) {
-	// Wakeup reason events can occur before or after the CPU running event they are attributed to,
-	// so we store these in a separate buffer until the next CPU running event is encountered.
-	s.appendWakeupReason(service, curTime)
+// StartWakeupReason adds the wakeup reason to the wakeup reason buffer.
+func (s *State) StartWakeupReason(service string, curTime int64) {
+	if s.curWakeupReason != nil {
+		s.appendWakeupReason(s.curWakeupReason, curTime)
+	}
+	// We need to keep track of what the current wakeup reason is so that we can log its start and end times.
+	s.curWakeupReason = &wakeupReason{
+		name:  service,
+		start: curTime,
+	}
 }
 
-// appendWakeUpReason appends the time and wakeup reason to the current wakeup reason string.
+// EndWakeupReason adds the wakeup reason to the wakeup reason buffer.
+func (s *State) EndWakeupReason(service string, curTime int64) error {
+	if s.curWakeupReason != nil {
+		if s.curWakeupReason.name != service {
+			return fmt.Errorf("tried to end a different wakeup reason (%q) than was started (%q)", service, s.curWakeupReason.name)
+		}
+		s.appendWakeupReason(s.curWakeupReason, curTime)
+		s.curWakeupReason = nil
+		return nil
+	}
+	// No current wakeup reason. "Start" and end this one.
+	s.appendWakeupReason(&wakeupReason{
+		name:  service,
+		start: curTime,
+	}, curTime)
+	return nil
+}
+
+// appendWakeUpReason appends the wakeup reason and its start time to the current wakeup reason string.
 // Each time and corresponding wakeup reason is separated by a ~, and each of these sets are delimited with pipes.
 // It strips out the leading and trailing double quotes from the wakeup reason to add.
-func (s *State) appendWakeupReason(service string, curTime int64) {
+func (s *State) appendWakeupReason(wr *wakeupReason, curTime int64) {
+	// Wakeup reason events can occur before or after the CPU running event they are attributed to,
+	// so we store these in a separate buffer until the next CPU running event is encountered.
+
 	// Existing wakeup reason(s). Append a delimiting pipe.
 	if s.wakeupReasonBuf.Len() > 0 {
 		s.wakeupReasonBuf.WriteString("|")
 	}
 
-	// Remove any leading or trailing double quotes in the wakeup reason we're adding.
-	// TODO: consider using the Go CSV library which can handle escaping quotes,
-	// and potentially replacing this with JSON.
-	service = strings.Trim(service, `"`)
-	s.wakeupReasonBuf.WriteString(fmt.Sprintf(`%v~%v`, curTime, service))
+	// Remove any leading or trailing double quotes in the wakeup reason we're adding for aesthetic purposes.
+	// TODO: consider replacing this with JSON.
+	n := stripQuotes(wr.name)
+	if wr.start == curTime {
+		// Instantaneous wakeup reason.
+		s.wakeupReasonBuf.WriteString(fmt.Sprintf(`%v~%v`, curTime, n))
+	} else {
+		s.wakeupReasonBuf.WriteString(fmt.Sprintf(`%v~%v~%v`, wr.start, curTime, n))
+	}
 }
 
 // wakeupReasons returns the currently stored wakeup reasons. If there are none, it appends an UnknownWakeup before returning.
 func (s *State) wakeupReasons(curTime int64) string {
+	if s.curWakeupReason != nil {
+		s.appendWakeupReason(s.curWakeupReason, curTime)
+	}
 	if s.wakeupReasonBuf.Len() == 0 {
-		s.appendWakeupReason(UnknownWakeup, curTime)
+		t := curTime
+		if s.runningEvent != nil {
+			// If there's already a running event, mark the wakeup reason as starting when the running event started.
+			t = s.runningEvent.e.Start
+		}
+		s.appendWakeupReason(&wakeupReason{name: UnknownWakeup, start: t}, curTime)
 	}
 	// Needs to be quoted, as any wakeup reason may have special characters such as commas.
 	return fmt.Sprintf(`"%s"`, s.wakeupReasonBuf.String())
@@ -227,10 +363,21 @@ func (s *State) PrintAllReset(curTime int64) {
 			e.Value = s.wakeupReasons(curTime)
 			s.wakeupReasonBuf.Reset()
 		}
-		s.print(e.Desc, e.Type, e.Start, curTime, e.Value, e.Opt)
+		s.Print(e.Desc, e.Type, e.Start, curTime, e.Value, e.Opt)
 	}
 	s.assignRunningEvent(nil)
 	s.entries = make(map[Key]Entry)
+}
+
+// PrintActiveEvent prints out all active entries for the given metric name with the given end time,
+// and deletes those entries from the map.
+func (s *State) PrintActiveEvent(metric string, endMs int64) {
+	for k, e := range s.entries {
+		if e.Desc == metric {
+			s.Print(e.Desc, e.Type, e.Start, endMs, e.Value, e.Opt)
+			delete(s.entries, k)
+		}
+	}
 }
 
 // EntryState is a commmon interface for the various types,
@@ -239,7 +386,7 @@ type EntryState interface {
 	// GetStartTime returns the start time of the entry.
 	GetStartTime() int64
 	// GetType returns the type of the entry:
-	// "string", "bool", "int" or "service".
+	// "string", "bool", "float", "group", "int", "service", or "summary".
 	GetType() string
 	// GetValue returns the stored value of the entry.
 	GetValue() string

@@ -1,10 +1,40 @@
 # Battery Historian
 
-Battery Historian is a tool to inspect battery related information and events on an Android device running Android 5.0 Lollipop (API level 21) and later, while the device was on battery. It allows application developers to visualize system and application level events on a timeline with panning and zooming functionality, easily see various aggregated statistics since the device was last fully charged, and select an application and inspect the metrics that impact battery specific to the chosen application. It also allows an A/B comparison of two bugreports, highlighting differences in key battery related metrics.
+Battery Historian is a tool to inspect battery related information and events on an Android device running Android 5.0 Lollipop (API level 21) and later, while the device was not plugged in. It allows application developers to visualize system and application level events on a timeline with panning and zooming functionality, easily see various aggregated statistics since the device was last fully charged, and select an application and inspect the metrics that impact battery specific to the chosen application. It also allows an A/B comparison of two bugreports, highlighting differences in key battery related metrics.
 
 ## Getting Started
 
-If you are new to the Go programming language:
+#### Using Docker
+
+Install [Docker](<https://docs.docker.com/engine/installation/>).
+
+Run the Battery Historian image. Choose a port number and replace `<port>` with
+that number in the commands below:
+
+```
+docker -- run -p <port>:9999 gcr.io/android-battery-historian/stable:3.0 --port 9999
+```
+
+For Linux and Mac OS X:
+
+* That's it, you're done! Historian will be available at
+  `http://localhost:<port>`.
+
+For Windows:
+
+* You may have to [enable Virtualization in your
+  BIOS](<http://www.itworld.com/article/2981515/virtualization/virtualbox-diagnose-and-fix-vt-xamd-v-hardware-acceleration-errors.html>).
+
+* Once you start Docker, it should tell you the IP address of the machine it is
+using. If, for example, the IP address is 123.456.78.90, Historian will be
+available at `http://123.456.78.90:<port>`.
+
+For more information about the port forwarding, see the [Docker
+documentation](<https://docs.docker.com/engine/reference/run/#/expose-incoming-ports>).
+
+#### Building from source code
+
+Make sure you have at least Golang version 1.8.1:
 
 * Follow the instructions available at <http://golang.org/doc/install> for downloading and installing the Go compilers, tools, and libraries.
 * Create a workspace directory according to the instructions at
@@ -60,7 +90,14 @@ go run cmd/battery-historian/battery-historian.go [--port <default:9999>]
 
 To take a bug report from your Android device, you will need to enable USB debugging under `Settings > System > Developer Options`. On Android 4.2 and higher, the Developer options screen is hidden by default. You can enable this by following the instructions [here](<http://developer.android.com/tools/help/adb.html#Enabling>).
 
-To obtain a bug report from your development device:
+To obtain a bug report from your development device running Android 7.0 and
+higher:
+
+```
+$ adb bugreport bugreport.zip
+```
+
+For devices 6.0 and lower:
 
 ```
 $ adb bugreport > bugreport.txt
@@ -155,24 +192,32 @@ there are different scripts for each device, with the only difference being
 the device-specific dmesg log it tries to find. These scripts have been
 integrated into the Battery Historian tool itself.
 
-##### Powermonitor analysis
+##### Power monitor analysis
 
-Powermonitor files should have the following format per line:
+Lines in power monitor files should have one of the following formats, and the
+format should be consistent throughout the entire file:
 
 ```
-<timestamp in epoch seconds> <amps>
+<timestamp in epoch seconds, with a fractional component> <amps> <optional_volts>
 ```
 
-Entries from the powermonitor file will be overlaid on top of the timeline plot.
+OR
 
-To ensure the powermonitor and bug report timelines are somewhat aligned,
-please reset the batterystats before running any powermonitor logging:
+```
+<timestamp in epoch milliseconds> <milliamps> <optional_millivolts>
+```
+
+Entries from the power monitor file will be overlaid on top of the timeline
+plot.
+
+To ensure the power monitor and bug report timelines are somewhat aligned,
+please reset the batterystats before running any power monitor logging:
 
 ```
 adb shell dumpsys batterystats --reset
 ```
 
-And take a bug report soon after stopping powermonitor logging.
+And take a bug report soon after stopping power monitor logging.
 
 If using a Monsoon:
 
@@ -225,7 +270,7 @@ $ go run cmd/checkin-delta/local_checkin_delta.go --input=bugreport_1.txt,bugrep
 
 - G+ Community (Discussion Thread: Battery Historian): https://plus.google.com/b/108967384991768947849/communities/114791428968349268860
 
-If you've found an error in this sample, please file an issue:
+If you've found an error in this project, please file an issue:
 <https://github.com/google/battery-historian/issues>
 
 ## License

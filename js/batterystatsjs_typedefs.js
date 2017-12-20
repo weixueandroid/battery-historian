@@ -53,9 +53,11 @@ goog.provide('batterystats.BatteryStats.System.BatteryLevel');
 goog.provide('batterystats.BatteryStats.System.BluetoothState');
 goog.provide('batterystats.BatteryStats.System.BluetoothState.Name');
 goog.provide('batterystats.BatteryStats.System.ChargeStep');
+goog.provide('batterystats.BatteryStats.System.ChargeTimeRemaining');
 goog.provide('batterystats.BatteryStats.System.DataConnection');
 goog.provide('batterystats.BatteryStats.System.DataConnection.Name');
 goog.provide('batterystats.BatteryStats.System.DischargeStep');
+goog.provide('batterystats.BatteryStats.System.DischargeTimeRemaining');
 goog.provide('batterystats.BatteryStats.System.DisplayState');
 goog.provide('batterystats.BatteryStats.System.DisplayState.State');
 goog.provide('batterystats.BatteryStats.System.GlobalBluetooth');
@@ -144,7 +146,11 @@ batterystats.BatteryStats.App.Audio;
 /**
  * @typedef {{
  *   ble_scan_time_msec: (number|undefined),
- *   ble_scan_count: (number|undefined)
+ *   ble_scan_count: (number|undefined),
+ *   ble_scan_count_bg: (number|undefined),
+ *   ble_scan_actual_time_msec: (number|undefined),
+ *   ble_scan_actual_time_msec_bg: (number|undefined),
+ *   ble_scan_result_count: (number|undefined)
  * }}
  */
 batterystats.BatteryStats.App.BluetoothMisc;
@@ -200,7 +206,17 @@ batterystats.BatteryStats.App.Foreground;
  *   mobile_active_time_msec: (number|undefined),
  *   mobile_active_count: (number|undefined),
  *   bt_bytes_rx: (number|undefined),
- *   bt_bytes_tx: (number|undefined)
+ *   bt_bytes_tx: (number|undefined),
+ *   mobile_wakeup_count: (number|undefined),
+ *   wifi_wakeup_count: (number|undefined),
+ *   mobile_bytes_bg_rx: (number|undefined),
+ *   mobile_bytes_bg_tx: (number|undefined),
+ *   wifi_bytes_bg_rx: (number|undefined),
+ *   wifi_bytes_bg_tx: (number|undefined),
+ *   mobile_packets_bg_rx: (number|undefined),
+ *   mobile_packets_bg_tx: (number|undefined),
+ *   wifi_packets_bg_rx: (number|undefined),
+ *   wifi_packets_bg_tx: (number|undefined)
  * }}
  */
 batterystats.BatteryStats.App.Network;
@@ -232,7 +248,9 @@ batterystats.BatteryStats.App.Process;
  * @typedef {{
  *   name: (string|undefined),
  *   total_time_msec: (number|undefined),
- *   count: (number|undefined)
+ *   count: (number|undefined),
+ *   background_time_msec: (number|undefined),
+ *   background_count: (number|undefined)
  * }}
  */
 batterystats.BatteryStats.App.ScheduledJob;
@@ -242,7 +260,10 @@ batterystats.BatteryStats.App.ScheduledJob;
  * @typedef {{
  *   number: (number|undefined),
  *   total_time_msec: (number|undefined),
- *   count: (number|undefined)
+ *   count: (number|undefined),
+ *   background_count: (number|undefined),
+ *   actual_time_msec: (number|undefined),
+ *   background_actual_time_msec: (number|undefined)
  * }}
  */
 batterystats.BatteryStats.App.Sensor;
@@ -266,7 +287,9 @@ batterystats.BatteryStats.App.StateTime;
  * @typedef {{
  *   name: (string|undefined),
  *   total_time_msec: (number|undefined),
- *   count: (number|undefined)
+ *   count: (number|undefined),
+ *   background_time_msec: (number|undefined),
+ *   background_count: (number|undefined)
  * }}
  */
 batterystats.BatteryStats.App.Sync;
@@ -315,10 +338,19 @@ batterystats.BatteryStats.App.Video;
  *   name: (string|undefined),
  *   full_time_msec: (number|undefined),
  *   full_count: (number|undefined),
+ *   full_current_duration_msec: (number|undefined),
+ *   full_max_duration_msec: (number|undefined),
+ *   full_total_duration_msec: (number|undefined),
  *   partial_time_msec: (number|undefined),
  *   partial_count: (number|undefined),
+ *   partial_current_duration_msec: (number|undefined),
+ *   partial_max_duration_msec: (number|undefined),
+ *   partial_total_duration_msec: (number|undefined),
  *   window_time_msec: (number|undefined),
- *   window_count: (number|undefined)
+ *   window_count: (number|undefined),
+ *   window_current_duration_msec: (number|undefined),
+ *   window_max_duration_msec: (number|undefined),
+ *   window_total_duration_msec: (number|undefined)
  * }}
  */
 batterystats.BatteryStats.App.Wakelock;
@@ -341,7 +373,10 @@ batterystats.BatteryStats.App.WakeupAlarm;
  *   scan_count: (number|undefined),
  *   idle_time_msec: (number|undefined),
  *   rx_time_msec: (number|undefined),
- *   tx_time_msec: (number|undefined)
+ *   tx_time_msec: (number|undefined),
+ *   scan_count_bg: (number|undefined),
+ *   scan_actual_time_msec: (number|undefined),
+ *   scan_actual_time_msec_bg: (number|undefined)
  * }}
  */
 batterystats.BatteryStats.App.Wifi;
@@ -412,7 +447,10 @@ batterystats.BatteryStats.ControllerActivity;
  *   total_uptime_msec: (number|undefined),
  *   start_clock_time_msec: (number|undefined),
  *   screen_off_realtime_msec: (number|undefined),
- *   screen_off_uptime_msec: (number|undefined)
+ *   screen_off_uptime_msec: (number|undefined),
+ *   estimated_battery_capacity_mah: (number|undefined),
+ *   min_learned_battery_capacity_uah: (number|undefined),
+ *   max_learned_battery_capacity_uah: (number|undefined)
  * }}
  */
 batterystats.BatteryStats.System.Battery;
@@ -423,7 +461,9 @@ batterystats.BatteryStats.System.Battery;
  *   lower_bound: (number|undefined),
  *   upper_bound: (number|undefined),
  *   screen_on: (number|undefined),
- *   screen_off: (number|undefined)
+ *   screen_off: (number|undefined),
+ *   total_mah: (number|undefined),
+ *   total_mah_screen_off: (number|undefined)
  * }}
  */
 batterystats.BatteryStats.System.BatteryDischarge;
@@ -472,6 +512,14 @@ batterystats.BatteryStats.System.ChargeStep;
 
 
 /**
+ * @typedef {{
+ *   usec: (number|undefined)
+ * }}
+ */
+batterystats.BatteryStats.System.ChargeTimeRemaining;
+
+
+/**
  * @enum {number}
  */
 batterystats.BatteryStats.System.DataConnection.Name = {
@@ -515,6 +563,14 @@ batterystats.BatteryStats.System.DataConnection;
  * }}
  */
 batterystats.BatteryStats.System.DischargeStep;
+
+
+/**
+ * @typedef {{
+ *   usec: (number|undefined)
+ * }}
+ */
+batterystats.BatteryStats.System.DischargeTimeRemaining;
 
 
 /**
@@ -597,7 +653,9 @@ batterystats.BatteryStats.System.IdleMode;
  * @typedef {{
  *   name: (string|undefined),
  *   time_msec: (number|undefined),
- *   count: (number|undefined)
+ *   count: (number|undefined),
+ *   current_duration_msec: (number|undefined),
+ *   max_duration_msec: (number|undefined)
  * }}
  */
 batterystats.BatteryStats.System.KernelWakelock;
@@ -839,8 +897,10 @@ batterystats.BatteryStats.System.WifiState;
  *   battery_level: (batterystats.BatteryStats.System.BatteryLevel|undefined),
  *   bluetooth_state: Array.<batterystats.BatteryStats.System.BluetoothState>,
  *   charge_step: Array.<batterystats.BatteryStats.System.ChargeStep>,
+ *   charge_time_remaining: (batterystats.BatteryStats.System.ChargeTimeRemaining|undefined),
  *   data_connection: Array.<batterystats.BatteryStats.System.DataConnection>,
  *   discharge_step: Array.<batterystats.BatteryStats.System.DischargeStep>,
+ *   discharge_time_remaining: (batterystats.BatteryStats.System.DischargeTimeRemaining|undefined),
  *   global_bluetooth: (batterystats.BatteryStats.System.GlobalBluetooth|undefined),
  *   global_bluetooth_controller: (batterystats.BatteryStats.ControllerActivity|undefined),
  *   global_modem_controller: (batterystats.BatteryStats.ControllerActivity|undefined),

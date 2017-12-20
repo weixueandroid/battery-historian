@@ -67,18 +67,19 @@ type AppStat struct {
 
 // HTMLData is the main structure passed to the frontend HTML template containing all analysis items.
 type HTMLData struct {
-	SDKVersion      int
-	DeviceID        string
-	DeviceModel     string
-	Historian       template.HTML
-	Count           int
-	UnplugSummaries []UnplugSummary
-	CheckinSummary  aggregated.Checkin
-	Error           string
-	Warning         string
-	Filename        string
-	AppStats        []AppStat
-	Overflow        bool
+	SDKVersion             int
+	DeviceID               string
+	DeviceModel            string
+	Historian              template.HTML
+	Count                  int
+	UnplugSummaries        []UnplugSummary
+	CheckinSummary         aggregated.Checkin
+	Error                  string
+	Warning                string
+	Filename               string
+	AppStats               []AppStat
+	Overflow               bool
+	HasBatteryStatsHistory bool
 }
 
 // CombinedCheckinSummary is the combined structure for the 2 files being compared
@@ -132,9 +133,11 @@ type HistogramStats struct {
 	WifiKiloBytesPerHr              aggregated.MFloat32
 	WifiDischargeRatePerHr          aggregated.MFloat32
 	BluetoothDischargeRatePerHr     aggregated.MFloat32
+	ModemDischargeRatePerHr         aggregated.MFloat32
 	WifiOnTimePercentage            float32
-	WifiTransmitTimePercentage      float32
-	BluetoothTransmitTimePercentage float32
+	WifiTransferTimePercentage      float32
+	BluetoothTransferTimePercentage float32
+	ModemTransferTimePercentage     float32
 	BluetoothOnTimePercentage       float32
 	// Wakelock Data
 	PartialWakelockTimePercentage float32
@@ -177,6 +180,7 @@ type UnplugSummary struct {
 	LevelDropPerHour float64
 	SystemStats      []DurationStats
 	BreakdownStats   []MultiDurationStats
+	PowerStates      map[string]parseutils.PowerState
 }
 
 // DurationStats contain stats on the occrurence frequency and activity duration of a metric present in history.
@@ -819,7 +823,9 @@ func decodeWakeupReasons(c *aggregated.Checkin) ([]string, []error) {
 }
 
 // Data returns a single structure (HTMLData) containing aggregated battery stats in html format.
-func Data(meta *bugreportutils.MetaInfo, fname string, summaries []parseutils.ActivitySummary, checkinOutput *bspb.BatteryStats, historianOutput string, warnings []string, errs []error, overflow bool) HTMLData {
+func Data(meta *bugreportutils.MetaInfo, fname string, summaries []parseutils.ActivitySummary,
+	checkinOutput *bspb.BatteryStats, historianOutput string,
+	warnings []string, errs []error, overflow, hasBatteryStatsHistory bool) HTMLData {
 	var output []UnplugSummary
 	ch := aggregated.ParseCheckinData(checkinOutput)
 	w, e := decodeWakeupReasons(&ch)
@@ -884,24 +890,27 @@ func Data(meta *bugreportutils.MetaInfo, fname string, summaries []parseutils.Ac
 				   mapPrint("ChargingStatusSummary", s.ChargingStatusSummary, duration),
 				*/
 			},
+			PowerStates: s.PowerStateOverallSummary,
 		}
 		output = append(output, t)
 	}
 	if checkinOutput.GetSystem().GetPowerUseSummary().GetBatteryCapacityMah() == 0 {
 		errs = append(errs, errors.New("device capacity is 0"))
 	}
+
 	return HTMLData{
-		DeviceID:        meta.DeviceID,
-		SDKVersion:      meta.SdkVersion,
-		DeviceModel:     meta.ModelName,
-		Historian:       template.HTML(historianOutput),
-		Filename:        fname,
-		Count:           len(output),
-		UnplugSummaries: output,
-		CheckinSummary:  ch,
-		Error:           historianutils.ErrorsToString(errs),
-		Warning:         strings.Join(warnings, "\n"),
-		AppStats:        parseAppStats(checkinOutput, meta.Sensors),
-		Overflow:        overflow,
+		DeviceID:               meta.DeviceID,
+		SDKVersion:             meta.SdkVersion,
+		DeviceModel:            meta.ModelName,
+		Historian:              template.HTML(historianOutput),
+		Filename:               fname,
+		Count:                  len(output),
+		UnplugSummaries:        output,
+		CheckinSummary:         ch,
+		Error:                  historianutils.ErrorsToString(errs),
+		Warning:                strings.Join(warnings, "\n"),
+		AppStats:               parseAppStats(checkinOutput, meta.Sensors),
+		Overflow:               overflow,
+		HasBatteryStatsHistory: hasBatteryStatsHistory,
 	}
 }

@@ -58,10 +58,15 @@ var (
 	// pidRE is a regular expression to match PID to app name and UID.
 	pidRE = regexp.MustCompile(`PID #` + `(?P<pid>\d+)` + `: ProcessRecord[^:]+:` + `(?P<app>[^/]+)` + `/` + `(?P<uid>.*)` + `}`)
 
-	// sensorLineRE is a regular expression to match the sensor list line in the sensorservice dump of a bug report.
-	sensorLineRE = regexp.MustCompile(`(?P<sensorName>[^|]+)` + `\|` + `(?P<sensorManufacturer>[^|]+)` + `\|` +
+	// sensorLineMMinusRE is a regular expression to match the sensor list line in the sensorservice dump of a bug report from MNC or before.
+	sensorLineMMinusRE = regexp.MustCompile(`(?P<sensorName>[^|]+)` + `\|` + `(?P<sensorManufacturer>[^|]+)` + `\|` +
 		`(\s*version=(?P<versionNumber>\d+)\s*\|)?` + `\s*(?P<sensorTypeString>[^|]+)` +
 		`\|` + `\s*(?P<sensorNumber>0x[0-9A-Fa-f]+)`)
+
+	// sensorLineNPlusRE is a regular expression to match the sensor list line in the sensorservice dump of a bug report starting from NRD42 and onwards.
+	sensorLineNPlusRE = regexp.MustCompile(`(?P<sensorNumber>0x?[0-9A-Fa-f]+)` + `\)\s*` +
+		`(?P<sensorName>[^|]+)` + `\s*\|` + `(?P<sensorManufacturer>[^|]+)` + `\|\s*ver:\s*` +
+		`(?P<versionNumber>\d+)` + `\s*\|\s*type:\s*` + `(?P<sensorTypeString>[^(]+)` + `\(\d+\)\s*\|`)
 
 	// TimeZoneRE is a regular expression to match the timezone string in a bug report.
 	TimeZoneRE = regexp.MustCompile(`^\[persist.sys.timezone\]:\s+\[` + `(?P<timezone>\S+)\]`)
@@ -111,6 +116,7 @@ func unzipAndExtract(fname string, b []byte) (map[string][]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("error copying from ZIP file: %v", err)
 		}
+		// Don't recursively extract from any sub-ZIP files since we use this to also extract .jar files for Closure.
 		files[fname+"~"+f.Name] = zc.Bytes()
 	}
 	return files, nil
@@ -199,25 +205,30 @@ Loop:
 		if !inSSection {
 			continue
 		}
-		if m, result := historianutils.SubexpNames(sensorLineRE, line); m {
-			n, err := strconv.ParseInt(result["sensorNumber"], 0, 32)
+		m, result := historianutils.SubexpNames(sensorLineMMinusRE, line)
+		if !m {
+			m, result = historianutils.SubexpNames(sensorLineNPlusRE, line)
+		}
+		if !m {
+			continue
+		}
+		n, err := strconv.ParseInt(result["sensorNumber"], 0, 32)
+		if err != nil {
+			return nil, err
+		}
+		v := 0
+		if x := result["versionNumber"]; x != "" {
+			v, err = strconv.Atoi(x)
 			if err != nil {
 				return nil, err
 			}
-			v := 0
-			if x := result["versionNumber"]; x != "" {
-				v, err = strconv.Atoi(x)
-				if err != nil {
-					return nil, err
-				}
-			}
+		}
 
-			sensors[int32(n)] = SensorInfo{
-				Name:    result["sensorName"],
-				Number:  int32(n),
-				Type:    result["sensorTypeString"],
-				Version: int32(v),
-			}
+		sensors[int32(n)] = SensorInfo{
+			Name:    result["sensorName"],
+			Number:  int32(n),
+			Type:    result["sensorTypeString"],
+			Version: int32(v),
 		}
 	}
 
@@ -309,18 +320,23 @@ func TimeStampToMs(timestamp, remainder string, loc *time.Location) (int64, erro
 	if err != nil {
 		return 0, err
 	}
-
 	// The remainder represents the fraction of a second. e.g. timestamp 2015-05-28 19:50:27.123456 has remainder 123456.
-	// The remainder will be parsed as ms, so only the leading 3 digits of the remainder are used.
-	// Make sure the remainder has at least 3 digits, so the slice operation doesn't fail.
-	remainder = fmt.Sprintf("%s000", remainder)
-	// Truncate the remainder to 3 decimal points.
-	remainder = remainder[:3]
-	parsedInt, err := strconv.ParseInt(remainder, 10, 64)
+	ms, err := SecFractionAsMs(remainder)
 	if err != nil {
 		return 0, err
 	}
-	return ((t.Unix() * 1000) + parsedInt), nil
+	return ((t.Unix() * 1000) + ms), nil
+}
+
+// SecFractionAsMs converts the fraction of a second to milliseconds.
+// e.g. "123456" from "27.123456" corresponds to 123ms (and 27 seconds).
+func SecFractionAsMs(fr string) (int64, error) {
+	// The string will be parsed as ms, so only the leading 3 digits of the string are used.
+	// Make sure the remainder has at least 3 digits, so the slice operation doesn't fail.
+	fr = fmt.Sprintf("%s000", fr)
+	// Truncate to 3 decimal points.
+	ms := fr[:3]
+	return strconv.ParseInt(ms, 10, 64)
 }
 
 // TimeZone extracts the time zone from a bug report.
@@ -330,7 +346,9 @@ func TimeZone(contents string) (*time.Location, error) {
 			return time.LoadLocation(result["timezone"])
 		}
 	}
-	return nil, errors.New("missing time zone line in bug report")
+	// If the timezone was missing, it's likely the phone was just reset and everything is in UTC time.
+	fmt.Println("missing time zone line in bug report")
+	return time.UTC, nil
 }
 
 // DumpState returns the parsed dumpstate information as a time object.

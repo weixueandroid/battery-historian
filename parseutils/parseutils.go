@@ -54,6 +54,14 @@ const (
 	ecnConnected    = `"CONNECTED"`
 	ecnDisconnected = `"DISCONNECTED"`
 	ecnSuspended    = `"SUSPENDED"`
+
+	// Battery history event names.
+	BatteryLevel  = "Battery Level"
+	Charging      = "Charging on"
+	Foreground    = "Foreground process"
+	LongWakelocks = "Long Wakelocks"
+	Plugged       = "Plugged"
+	Top           = "Top app"
 )
 
 var (
@@ -142,9 +150,13 @@ type Dist struct {
 	MaxDuration   time.Duration
 }
 
-// interval is used for gathering all sync durations to summarize total sync time.
-type interval struct {
-	startTimeMs, endTimeMs int64
+// addDuration adds the given duration to the total Dist duration, incrementing Num, and updating MaxDuration if necessary.
+func (d *Dist) addDuration(dur time.Duration) {
+	d.Num++
+	d.TotalDuration += dur
+	if dur > d.MaxDuration {
+		d.MaxDuration = dur
+	}
 }
 
 // DCPU are CPU related statistics that detail the entire previous discharge step.
@@ -164,10 +176,41 @@ type DCPU struct {
 }
 
 // AppCPUUsage is per app cpu usage in DCPU.
+// It also implements the csv.EntryState interface.
 type AppCPUUsage struct {
+	start int64
+
+	pkgName    string
 	UID        string
 	UserTime   time.Duration
 	SystemTime time.Duration
+}
+
+// GetStartTime returns the start time of the entry.
+func (p *AppCPUUsage) GetStartTime() int64 {
+	return p.start
+}
+
+// GetType returns the type of the entry.
+func (p *AppCPUUsage) GetType() string {
+	return "summary"
+}
+
+// GetValue returns the stored value of the entry.
+func (p *AppCPUUsage) GetValue() string {
+	n := p.pkgName
+	if n == "" {
+		n = fmt.Sprintf("UID %s", p.UID)
+	}
+	return fmt.Sprintf("%s~%s~%s", n, p.UserTime, p.SystemTime)
+}
+
+// GetKey returns the unique identifier for the entry.
+func (p *AppCPUUsage) GetKey(metric string) csv.Key {
+	return csv.Key{
+		Metric:     metric,
+		Identifier: fmt.Sprintf("%s(%d)", p.UID, p.start),
+	}
 }
 
 func (s *DCPU) initStart(curTime int64) {
@@ -199,20 +242,131 @@ func (s *DPST) initStart(curTime int64) {
 	}
 }
 
+// Voter represents a voter for one of the low power states.
+type Voter struct {
+	// Name of the voter.
+	Name string
+	// Time the voter spent voting for its power state.
+	Time time.Duration
+	// How many times the voter had a 'yes' vote.
+	Count int32
+}
+
+// PowerState represents one of the low power states that the CPU can go into.
+type PowerState struct {
+	// BatteryLevel is the starting battery level before battery drop.
+	batteryLevel int
+
+	// Start time of the battery level drop
+	start int64
+
+	// Level of the power state. A higher level represents a deeper (less power consuming) state.
+	Level int32
+	// Name of the power state.
+	Name string
+	// Voters for this particular power state.
+	Voters []Voter
+	// Time spent in this state
+	Time time.Duration
+	// Count is how many times this state was entered.
+	Count int32
+}
+
+// GetStartTime returns the start time of the entry.
+func (p *PowerState) GetStartTime() int64 {
+	return p.start
+}
+
+// GetType returns the type of the entry.
+func (p *PowerState) GetType() string {
+	return "summary"
+}
+
+// GetValue returns the stored value of the entry.
+func (p *PowerState) GetValue() string {
+	return fmt.Sprintf("%s~%s~%d", p.Name, p.Time, p.Count)
+}
+
+// GetKey returns the unique identifier for the entry.
+func (p *PowerState) GetKey(metric string) csv.Key {
+	return csv.Key{
+		Metric:     metric,
+		Identifier: fmt.Sprintf("%s(%d)", p.Name, p.batteryLevel),
+	}
+}
+
+// csvLogVoterEntries returns a list of csv.Entries that indicate the voting record for the PowerState.
+func (p *PowerState) csvLogVoterEntries() []csv.Entry {
+	var ce []csv.Entry
+	for _, v := range p.Voters {
+		ce = append(ce, csv.Entry{
+			Desc:  fmt.Sprintf("%s(%s)", p.Name, v.Name),
+			Start: p.start,
+			Type:  "float",
+			Value: fmt.Sprintf("%.3f", v.Time.Minutes()),
+		})
+	}
+	return ce
+}
+
+// powerStateTimer is a wrapper struct around PowerState to allow saving only the timing info to CSV.
+type powerStateTimer struct {
+	PowerState
+}
+
+// GetType returns the type of the entry.
+func (p *powerStateTimer) GetType() string {
+	return "float"
+}
+
+// GetValue returns the stored value of the entry.
+func (p *powerStateTimer) GetValue() string {
+	return fmt.Sprintf("%.3f", p.Time.Minutes())
+}
+
+// rpmStatsGroupEntry returns a csv.Entry that can be used to group rpm lines in the Historian timeline.
+func rpmStatsGroupEntry(ps []*PowerState) csv.Entry {
+	var n []string
+	var s int64
+	for _, p := range ps {
+		n = append(n, p.Name)
+		for _, v := range p.Voters {
+			n = append(n, fmt.Sprintf("%s(%s)", p.Name, v.Name))
+		}
+		s = p.start
+	}
+	return csv.Entry{
+		Desc:  "RPM Stats",
+		Start: s,
+		Type:  "group",
+		Value: strings.Join(n, "|"),
+		Opt:   "minutes",
+	}
+}
+
+// voterByName sorts voters by their name in ascending order.
+type voterByName []Voter
+
+func (a voterByName) Len() int      { return len(a) }
+func (a voterByName) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+func (a voterByName) Less(i, j int) bool {
+	return a[i].Name < a[j].Name
+}
+
 // Calculate total duration of sync time without breaking down by apps.
 func calTotalSync(state *DeviceState) Dist {
 	var d Dist
 	d.Num = int32(len(state.syncIntervals))
 
 	// merge intervals
-	var intervals []interval
+	var intervals []csv.Event
 	if d.Num > 0 {
-		intervals = mergeIntervals(state.syncIntervals)
+		intervals = csv.MergeEvents(state.syncIntervals)
 	}
 
 	// loop through intervals to gather total sync time
 	for _, i := range intervals {
-		duration := time.Duration(i.endTimeMs-i.startTimeMs) * time.Millisecond
+		duration := time.Duration(i.End-i.Start) * time.Millisecond
 		d.TotalDuration += duration
 		// the max duration here is the merged intervals' max duration
 		if duration > d.MaxDuration {
@@ -222,35 +376,11 @@ func calTotalSync(state *DeviceState) Dist {
 	return d
 }
 
-// Merge all the intervals for syncs in all apps
-func mergeIntervals(intervals []interval) []interval {
-	// Need to sort the intervals by startTime here,
-	// because the following algorithm will be relied on sorted intervals
-	sort.Sort(sortByStartTime(intervals))
-
-	var res []interval
-	prev := intervals[0]
-	for _, cur := range intervals[1:] {
-		if prev.endTimeMs < cur.startTimeMs {
-			res = append(res, prev)
-			prev = cur
-		} else {
-			prev = interval{prev.startTimeMs, max(prev.endTimeMs, cur.endTimeMs)}
-		}
-	}
-	res = append(res, prev)
-	return res
-}
-
 // addSummaryEntry adds an event spanning a time interval from suid.Start to curTime into summary map.
 func (s *ServiceUID) addSummaryEntry(curTime int64, suid *ServiceUID, summary map[string]Dist) {
 	d := summary[s.Service]
 	if duration := time.Duration(curTime-suid.Start) * time.Millisecond; duration > 0 {
-		d.TotalDuration += duration
-		if duration > d.MaxDuration {
-			d.MaxDuration = duration
-		}
-		d.Num++
+		d.addDuration(duration)
 		summary[s.Service] = d
 	}
 }
@@ -274,6 +404,9 @@ func (s *ServiceUID) assign(curTime int64, summaryActive, logEvent bool, summary
 		if alreadyActive {
 			return fmt.Errorf("two positive transitions seen for %q", desc)
 		}
+		// To avoid saying an event occurred before the summary start time. This could happen in the
+		// long wakelock case, where we calculate back when the wakelock actually started.
+		curTime = historianutils.MaxInt64(curTime, summaryStartTime)
 		s.Start = curTime
 		activeMap[value] = s
 
@@ -320,11 +453,7 @@ func (s *ServiceUID) updateSummary(curTime int64, summaryActive bool, summarySta
 	if summaryActive {
 		d := summary[s.Service]
 		duration := time.Duration(curTime-s.Start) * time.Millisecond
-		d.TotalDuration += duration
-		if duration > d.MaxDuration {
-			d.MaxDuration = duration
-		}
-		d.Num++
+		d.addDuration(duration)
 		summary[s.Service] = d
 	}
 	s.Start = curTime
@@ -438,11 +567,7 @@ func (s *tsBool) assign(curTime int64, summaryActive bool, summaryStartTime int6
 		if summaryActive {
 			duration := time.Duration(curTime-s.Start) * time.Millisecond
 			if duration > 0 {
-				summary.TotalDuration += duration
-				if duration > summary.MaxDuration {
-					summary.MaxDuration = duration
-				}
-				summary.Num++
+				summary.addDuration(duration)
 			}
 		}
 		s.Value = false
@@ -473,11 +598,7 @@ func (s *tsBool) updateSummary(curTime int64, summaryActive bool, summaryStartTi
 	if s.Value {
 		if summaryActive {
 			duration := time.Duration(curTime-s.Start) * time.Millisecond
-			summary.TotalDuration += duration
-			if duration > summary.MaxDuration {
-				summary.MaxDuration = duration
-			}
-			summary.Num++
+			summary.addDuration(duration)
 		}
 		s.Start = curTime
 	}
@@ -527,11 +648,7 @@ func (s *tsString) assign(curTime int64, summaryActive bool, summaryStartTime in
 			d := summary[s.Value]
 			duration := time.Duration(curTime-s.Start) * time.Millisecond
 			if duration > 0 {
-				d.TotalDuration += duration
-				if duration > d.MaxDuration {
-					d.MaxDuration = duration
-				}
-				d.Num++
+				d.addDuration(duration)
 				summary[s.Value] = d
 			}
 		}
@@ -562,11 +679,7 @@ func (s *tsString) updateSummary(curTime int64, summaryActive bool, summaryStart
 	if summaryActive {
 		d := summary[s.Value]
 		duration := time.Duration(curTime-s.Start) * time.Millisecond
-		d.TotalDuration += duration
-		if duration > d.MaxDuration {
-			d.MaxDuration = duration
-		}
-		d.Num++
+		d.addDuration(duration)
 		summary[s.Value] = d
 	}
 	s.Start = curTime
@@ -608,6 +721,12 @@ type DeviceState struct {
 	LastWakeupDuration time.Duration // To deal with asynchronous arrival
 	isDpstEvent        bool          // To determine whether the key is a part of Dpst's value
 	dpstTokenIndex     int           // To determine the token's index in Dpst
+	lastBatteryLevel   tsInt         // To handle summary data that is printed after the battery level changes.
+	// The power state summary is printed as an aggregate since boot, so we need to track
+	// the cummulative in order to split the summary per battery level or discharge session.
+	CummulativePowerState map[string]*PowerState
+	// The first Power State value logged in the report. Used to provide a base reference for the timeline values.
+	InitialPowerState map[string]*PowerState
 
 	// Instanteous state
 	Temperature   tsInt
@@ -657,7 +776,7 @@ type DeviceState struct {
 	WakeLockHolder ServiceUID
 	WakeupReason   ServiceUID
 
-	syncIntervals []interval
+	syncIntervals []csv.Event
 
 	// Map of uid -> serviceUID for all active entities
 	ActiveProcessMap     map[string]*ServiceUID
@@ -670,6 +789,7 @@ type DeviceState struct {
 	// analyzeHistoryLine. So even though changes aren't specific to an app, for the sake
 	// of simplicity, they are processed like the rest.
 	ConnectivityMap map[string]*ServiceUID
+	LongWakelockMap map[string]*ServiceUID
 	ScheduledJobMap map[string]*ServiceUID
 	TmpWhiteListMap map[string]*ServiceUID // TmpWhiteList contains apps that are given temporary network access after receiving a high priority GCM message.
 
@@ -762,6 +882,10 @@ func (state *DeviceState) initStartTimeForAllStates() {
 		s.initStart(state.CurrentTime)
 	}
 
+	for _, s := range state.LongWakelockMap {
+		s.initStart(state.CurrentTime)
+	}
+
 	for _, s := range state.WakeLockMap {
 		s.initStart(state.CurrentTime)
 	}
@@ -779,19 +903,39 @@ func (state *DeviceState) initStartTimeForAllStates() {
 	}
 }
 
+// topApp returns the current app on top.
+func (state *DeviceState) topApp() (*ServiceUID, error) {
+	m := state.TopApplicationMap
+	switch len(m) {
+	case 0: // No active app.
+		return nil, nil
+	case 1: // The expected case.
+		// Even in multi-window mode, the battery history only lists one app as being the top app.
+		for _, suid := range m {
+			return suid, nil
+		}
+		return nil, errors.New("unreachable code")
+	default:
+		return nil, fmt.Errorf("too many apps simultaneously on top: (|TopApplicationMap| = %d)", len(m))
+	}
+}
+
 // newDeviceState returns a new properly initialized DeviceState structure.
 func newDeviceState() *DeviceState {
 	return &DeviceState{
-		ActiveProcessMap:     make(map[string]*ServiceUID),
-		AppSyncingMap:        make(map[string]*ServiceUID),
-		ForegroundProcessMap: make(map[string]*ServiceUID),
-		TopApplicationMap:    make(map[string]*ServiceUID),
-		ConnectivityMap:      make(map[string]*ServiceUID),
-		WakeLockMap:          make(map[string]*ServiceUID),
-		ScheduledJobMap:      make(map[string]*ServiceUID),
-		TmpWhiteListMap:      make(map[string]*ServiceUID),
-		AlarmMap:             make(map[string]*ServiceUID),
-		ScreenOn:             tsBool{data: unknownScreenOnReason},
+		ActiveProcessMap:      make(map[string]*ServiceUID),
+		AppSyncingMap:         make(map[string]*ServiceUID),
+		ForegroundProcessMap:  make(map[string]*ServiceUID),
+		TopApplicationMap:     make(map[string]*ServiceUID),
+		ConnectivityMap:       make(map[string]*ServiceUID),
+		LongWakelockMap:       make(map[string]*ServiceUID),
+		WakeLockMap:           make(map[string]*ServiceUID),
+		ScheduledJobMap:       make(map[string]*ServiceUID),
+		TmpWhiteListMap:       make(map[string]*ServiceUID),
+		AlarmMap:              make(map[string]*ServiceUID),
+		ScreenOn:              tsBool{data: unknownScreenOnReason},
+		CummulativePowerState: make(map[string]*PowerState),
+		InitialPowerState:     make(map[string]*PowerState),
 	}
 }
 
@@ -840,6 +984,7 @@ type ActivitySummary struct {
 	ConnectivitySummary      map[string]Dist
 	ForegroundProcessSummary map[string]Dist
 	ActiveProcessSummary     map[string]Dist
+	LongWakelockSummary      map[string]Dist
 	TopApplicationSummary    map[string]Dist
 	PerAppSyncSummary        map[string]Dist
 	WakeupReasonSummary      map[string]Dist
@@ -861,18 +1006,66 @@ type ActivitySummary struct {
 
 	// DpstStatsSummary and DcpuStatsSummary shows details of
 	// app cpu usage and proc stats in each battery steps.
-	DpstStatsSummary []DPST
-	DcpuStatsSummary []DCPU
+	DpstStatsSummary  []DPST
+	DcpuStatsSummary  []DCPU
+	PowerStateSummary []PowerState
 
-	// an aggregated overall summary for DpstStatsSummary and
+	// An aggregated summary for DpstStatsSummary and
 	// DcpuStatsSummary in the whole summary duration.
 	DpstOverallSummary map[string]time.Duration
 	DcpuOverallSummary map[string]time.Duration
+
+	PowerStateOverallSummary map[string]PowerState
 
 	// device state for debug
 	AlarmSummary map[string]Dist
 
 	Date string
+}
+
+func (s *ActivitySummary) appendPowerState(ps *PowerState) error {
+	s.PowerStateSummary = append(s.PowerStateSummary, *ps)
+
+	// Add to overall summary
+	if po, ok := s.PowerStateOverallSummary[ps.Name]; ok {
+		if ps.Level != po.Level {
+			return fmt.Errorf("power state levels are different. ps = %d, po = %d", ps.Level, po.Level)
+		}
+		if ps.Name != po.Name {
+			return fmt.Errorf("power state names are different. ps = %q, po = %q", ps.Name, po.Name)
+		}
+		svl := len(ps.Voters)
+		if svl != len(po.Voters) {
+			return fmt.Errorf("power states have different number of voters. ps has %d, po has %d", svl, len(po.Voters))
+		}
+		p := PowerState{
+			// Level and name should stay the same
+			Level: po.Level,
+			Name:  po.Name,
+
+			Time:  po.Time + ps.Time,
+			Count: po.Count + ps.Count,
+		}
+		sort.Sort(voterByName(po.Voters))
+		sort.Sort(voterByName(ps.Voters))
+		for i := 0; i < svl; i++ {
+			m, s := po.Voters[i], ps.Voters[i]
+			if m.Name != s.Name {
+				return fmt.Errorf("power state voter #%d names are different. ps.V = %q, po.V = %q", i, s.Name, m.Name)
+			}
+			p.Voters = append(p.Voters, Voter{
+				// Name should stay the same.
+				Name: m.Name,
+
+				Time:  m.Time + s.Time,
+				Count: m.Count + s.Count,
+			})
+		}
+		s.PowerStateOverallSummary[p.Name] = p
+	} else {
+		s.PowerStateOverallSummary[ps.Name] = *ps
+	}
+	return nil
 }
 
 // newActivitySummary returns a new properly initialized ActivitySummary structure.
@@ -892,6 +1085,7 @@ func newActivitySummary(summaryFormat string) *ActivitySummary {
 		HealthSummary:              make(map[string]Dist),
 		PlugTypeSummary:            make(map[string]Dist),
 		ChargingStatusSummary:      make(map[string]Dist),
+		LongWakelockSummary:        make(map[string]Dist),
 		PhoneStateSummary:          make(map[string]Dist),
 		WakeLockSummary:            make(map[string]Dist),
 		WakeLockDetailedSummary:    make(map[string]Dist),
@@ -903,6 +1097,7 @@ func newActivitySummary(summaryFormat string) *ActivitySummary {
 		AlarmSummary:               make(map[string]Dist),
 		UserRunningSummary:         make(map[string]Dist),
 		UserForegroundSummary:      make(map[string]Dist),
+		PowerStateOverallSummary:   make(map[string]PowerState),
 		DcpuOverallSummary:         make(map[string]time.Duration),
 		DpstOverallSummary: map[string]time.Duration{
 			"usr":  0,
@@ -934,25 +1129,8 @@ func (a SortByTimeAndCount) Less(i, j int) bool {
 	return a[i].Stat.Num < a[j].Stat.Num
 }
 
-// sortByStartTime sorts intervals in ascending order of startTimeMs
-type sortByStartTime []interval
-
-func (a sortByStartTime) Len() int      { return len(a) }
-func (a sortByStartTime) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
-func (a sortByStartTime) Less(i, j int) bool {
-	return a[i].startTimeMs < a[j].startTimeMs
-}
-
-// max function for int64
-func max(a int64, b int64) int64 {
-	if a >= b {
-		return a
-	}
-	return b
-}
-
 // concludeActiveFromState summarizes all activeProcesses, syncs running, apps on top, etc.
-func concludeActiveFromState(state *DeviceState, summary *ActivitySummary, csv *csv.State) (*DeviceState, *ActivitySummary) {
+func concludeActiveFromState(state *DeviceState, summary *ActivitySummary) (*DeviceState, *ActivitySummary) {
 	// Battery level: Bl **
 	if state.BatteryLevel.Value != summary.FinalBatteryLevel {
 		// Throw: Logical error as summary.FinalBatteryLevel should already be up to date
@@ -1053,7 +1231,6 @@ func concludeActiveFromState(state *DeviceState, summary *ActivitySummary, csv *
 	/////////////////////////
 	// wake_reason: wr **
 	if state.WakeupReason.Service != "" {
-		//TODO: Handle case of multiple wake_reasons for a wakeup.
 		state.WakeupReason.updateSummary(state.CurrentTime, summary.Active, summary.StartTimeMs, summary.WakeupReasonSummary)
 	}
 
@@ -1090,11 +1267,16 @@ func concludeActiveFromState(state *DeviceState, summary *ActivitySummary, csv *
 			start = suid.Start
 		}
 		if summary.Active {
-			i := interval{start, state.CurrentTime}
+			i := csv.Event{Start: start, End: state.CurrentTime}
 			state.syncIntervals = append(state.syncIntervals, i)
 		}
 
 		suid.updateSummary(state.CurrentTime, summary.Active, summary.StartTimeMs, summary.PerAppSyncSummary)
+	}
+
+	// Long-held wakelocks: Elw
+	for _, suid := range state.LongWakelockMap {
+		suid.updateSummary(state.CurrentTime, summary.Active, summary.StartTimeMs, summary.LongWakelockSummary)
 	}
 
 	// wakelock_in: Ewl **
@@ -1116,11 +1298,7 @@ func concludeActiveFromState(state *DeviceState, summary *ActivitySummary, csv *
 		if summary.Active {
 			d := ntwkSummary[t]
 			duration := time.Duration(state.CurrentTime-suid.Start) * time.Millisecond
-			d.TotalDuration += duration
-			if duration > d.MaxDuration {
-				d.MaxDuration = duration
-			}
-			d.Num++
+			d.addDuration(duration)
 			ntwkSummary[t] = d
 		}
 		suid.Start = state.CurrentTime
@@ -1148,18 +1326,18 @@ func concludeActiveFromState(state *DeviceState, summary *ActivitySummary, csv *
 // summarizeActiveState stores the current summary in the output slice and resets the summary.
 // If a reset of state is requested too (after a reboot or a reset of battery history) only then
 // is the state cleared, otherwise the state is retained after summarizing.
-func summarizeActiveState(d *DeviceState, s *ActivitySummary, summaries *[]ActivitySummary, reset bool, reason string, csv *csv.State) (*DeviceState, *ActivitySummary) {
+func summarizeActiveState(d *DeviceState, s *ActivitySummary, summaries *[]ActivitySummary, reset bool, reason string) (*DeviceState, *ActivitySummary) {
 	// TODO: Revisit this filtering logic if we also want to print
 	// summary for durations when the device was charging
 	if s.StartTimeMs != s.EndTimeMs {
 		s.Reason = reason
-		d, s = concludeActiveFromState(d, s, csv)
+		d, s = concludeActiveFromState(d, s)
 		s.TotalSyncSummary = calTotalSync(d)
 		*summaries = append(*summaries, *s)
 	}
 
 	s = newActivitySummary(s.SummaryFormat)
-	d.syncIntervals = []interval{}
+	d.syncIntervals = []csv.Event{}
 
 	if !reset {
 		s.StartTimeMs = d.CurrentTime
@@ -1272,6 +1450,7 @@ func (s *ActivitySummary) Print(b io.Writer) {
 	printMap(b, "ChargingStatusSummary", s.ChargingStatusSummary, duration)
 	printMap(b, "PhoneStateSummary", s.PhoneStateSummary, duration)
 	printMap(b, "ActiveProcessSummary", s.ActiveProcessSummary, duration)
+	printMap(b, "LongWakelockSummary", s.LongWakelockSummary, duration)
 	printMap(b, "ScheduledJobSummary", s.ScheduledJobSummary, duration)
 	printMap(b, "TmpWhiteListSummary", s.TmpWhiteListSummary, duration)
 	printMap(b, "WifiSupplSummary", s.WifiSupplSummary, duration)
@@ -1284,6 +1463,10 @@ func (s *ActivitySummary) Print(b io.Writer) {
 
 	printDpstSlice(b, "DpstStatsSummary", s.DpstStatsSummary)
 	printDuration(b, "DpstOverallSummary", s.DpstOverallSummary)
+
+	printPowerStates(b, s.PowerStateSummary)
+
+	fmt.Fprintln(b)
 }
 
 func (d *Dist) print(b io.Writer, duration time.Duration) {
@@ -1291,6 +1474,10 @@ func (d *Dist) print(b io.Writer, duration time.Duration) {
 }
 
 func printMap(b io.Writer, name string, m map[string]Dist, duration time.Duration) {
+	if len(m) == 0 {
+		return
+	}
+
 	stats := make([]MultiDist, len(m), len(m))
 	idx := 0
 	for k, v := range m {
@@ -1309,6 +1496,10 @@ func printMap(b io.Writer, name string, m map[string]Dist, duration time.Duratio
 }
 
 func printDcpuSlice(b io.Writer, name string, slice []DCPU) {
+	if len(slice) == 0 {
+		return
+	}
+
 	fmt.Fprintln(b, name, "\n--------------------------")
 	for _, s := range slice {
 		fmt.Fprintf(b, "=> BatteryLevel: %d\t Duration: %20s\t UserTime: %10s\t SystemTime: %10s\n", s.BatteryLevel, s.Duration, s.UserTime, s.SystemTime)
@@ -1320,6 +1511,10 @@ func printDcpuSlice(b io.Writer, name string, slice []DCPU) {
 }
 
 func printDpstSlice(b io.Writer, name string, slice []DPST) {
+	if len(slice) == 0 {
+		return
+	}
+
 	fmt.Fprintln(b, name, "\n--------------------------")
 	for _, s := range slice {
 		fmt.Fprintf(b, "=> BatteryLevel: %d\t Duration: %20s\t StatUserTime: %10s\t StatSystemTime: %10s\t StatIOWaitTime: %10s\t StatIrqTime: %10s\t StatSoftIrqTime: %10s\t StatIdlTime: %10s\n", s.BatteryLevel, s.Duration, s.StatUserTime, s.StatSystemTime, s.StatIOWaitTime, s.StatIrqTime, s.StatSoftIrqTime, s.StatIdlTime)
@@ -1328,6 +1523,10 @@ func printDpstSlice(b io.Writer, name string, slice []DPST) {
 }
 
 func printDuration(b io.Writer, name string, m map[string]time.Duration) {
+	if len(m) == 0 {
+		return
+	}
+
 	fmt.Fprintln(b, name, "\n--------------------------")
 	for k, v := range m {
 		fmt.Fprintf(b, "\t Name: %10s\t Duration: %20s\t\n", k, v)
@@ -1335,25 +1534,150 @@ func printDuration(b io.Writer, name string, m map[string]time.Duration) {
 	fmt.Fprintln(b)
 }
 
-func topApp(activeMap map[string]*ServiceUID) (*ServiceUID, error) {
-	switch len(activeMap) {
-	case 0: // No active app.
-		return nil, nil
-	case 1: // The expected case.
-		for _, suid := range activeMap {
-			return suid, nil
-		}
-		return nil, errors.New("unreachable code")
-	default:
-		return nil, fmt.Errorf("too many apps active simultaneously (|TopApplicationMap| = %d)", len(activeMap))
+func printPowerStates(b io.Writer, states []PowerState) {
+	if len(states) == 0 {
+		return
 	}
+
+	fmt.Fprintln(b, "Low power states", "\n--------------------------")
+	bl := -1
+	for _, ps := range states {
+		if bl != ps.batteryLevel {
+			bl = ps.batteryLevel
+			fmt.Fprintf(b, "=> Battery level: %d\n", bl)
+		}
+		fmt.Fprintf(b, "    (%d) %-15s ==>\tDuration: %20s\t Count: %d\n", ps.Level, ps.Name, ps.Time, ps.Count)
+		for _, v := range ps.Voters {
+			fmt.Fprintf(b, "          %-13s -->\tDuration: %20s\t Count: %d\n", v.Name, v.Time, v.Count)
+		}
+	}
+	fmt.Fprintln(b)
+}
+
+// Regular expressions to match different sections of the low power state output.
+const (
+	voterREString = `voter_\d+\s+name=(?P<name>\S+)\s+time=(?P<time>\d+)\s+count=(?P<count>\d+)\s*`
+	stateREString = `state_(?P<idx>\d+)\s+name=(?P<name>\S+)\s+time=(?P<time>\d+)\s+count=(?P<count>\d+)\s*`
+)
+
+var (
+	voterRE          = regexp.MustCompile(voterREString)
+	stateRE          = regexp.MustCompile(stateREString)
+	fullPowerStateRE = regexp.MustCompile(stateREString + `\s*(?P<voters>(` + voterREString + `)*)`)
+)
+
+// parsePowerStates parses a full power state line.
+// Example format:
+// state_1 name=XO_shutdown time=0 count=0 voter_1 name=APSS time=264740801 count=85367 voter_2 name=MPSS time=314921409 count=286147 voter_3 name=LPASS time=339626342 count=96649 state_2 name=VMIN time=245626000 count=289658
+// Times are printed in milliseconds.
+func parsePowerStates(input string) ([]*PowerState, error) {
+	split := fullPowerStateRE.FindAllString(input, -1)
+	if len(split) == 0 {
+		return nil, fmt.Errorf("invalid power_state line: %q", input)
+	}
+	var states []*PowerState
+	for _, s := range split {
+		// Need to use stateRE here so that voter info doesn't accidentally get used.
+		match, st := historianutils.SubexpNames(stateRE, s)
+		if !match {
+			return nil, fmt.Errorf(`couldn't find power state info in "%v"`, s)
+		}
+		idx, err := strconv.Atoi(st["idx"])
+		if err != nil {
+			return nil, fmt.Errorf("error getting power state level from string: %v", err)
+		}
+		tm, err := strconv.Atoi(st["time"])
+		if err != nil {
+			return nil, fmt.Errorf("error getting power state time from string: %v", err)
+		}
+		c, err := strconv.Atoi(st["count"])
+		if err != nil {
+			return nil, fmt.Errorf("error getting power state count from string: %v", err)
+		}
+		ps := PowerState{
+			Level: int32(idx),
+			Name:  st["name"],
+			Time:  time.Duration(tm) * time.Millisecond,
+			Count: int32(c),
+		}
+
+		match, f := historianutils.SubexpNames(fullPowerStateRE, s)
+		if !match {
+			// This case should never happen because s is created from fullPowerStateRE.FindAllString.
+			return nil, fmt.Errorf("matched string didn't match: %q", s)
+		}
+		vs := voterRE.FindAllString(f["voters"], -1)
+		for _, v := range vs {
+			match, vt := historianutils.SubexpNames(voterRE, v)
+			if !match {
+				// This case should never happen because v is created from voterRE.FindAllString.
+				return nil, fmt.Errorf("matched string didn't match: %q", v)
+			}
+			tm, err = strconv.Atoi(vt["time"])
+			if err != nil {
+				return nil, fmt.Errorf("error getting voter time from string: %v", err)
+			}
+			c, err = strconv.Atoi(vt["count"])
+			if err != nil {
+				return nil, fmt.Errorf("error getting voter count from string: %v", err)
+			}
+			ps.Voters = append(ps.Voters, Voter{
+				Name:  vt["name"],
+				Time:  time.Duration(tm) * time.Millisecond,
+				Count: int32(c),
+			})
+		}
+		states = append(states, &ps)
+	}
+	return states, nil
+}
+
+// subtractPowerStates subtracts one power state from another.
+// Subtrahend is subtracted from Minuend (https://en.wikipedia.org/wiki/Subtraction).
+// The PowerStates are expected to be the same state (same name, level, and set of voters).
+func subtractPowerStates(min, sub *PowerState) (*PowerState, error) {
+	if sub.Level != min.Level {
+		return nil, fmt.Errorf("power state levels are different. sub = %d, min = %d", sub.Level, min.Level)
+	}
+	if sub.Name != min.Name {
+		return nil, fmt.Errorf("power state names are different. sub = %q, min = %q", sub.Name, min.Name)
+	}
+	svl := len(sub.Voters)
+	if svl != len(min.Voters) {
+		return nil, fmt.Errorf("power states have different number of voters. sub has %d, min has %d", svl, len(min.Voters))
+	}
+	ps := PowerState{
+		// Level and name should stay the same
+		Level: min.Level,
+		Name:  min.Name,
+
+		batteryLevel: min.batteryLevel - sub.batteryLevel,
+		Time:         min.Time - sub.Time,
+		Count:        min.Count - sub.Count,
+	}
+	sort.Sort(voterByName(min.Voters))
+	sort.Sort(voterByName(sub.Voters))
+	for i := 0; i < svl; i++ {
+		m, s := min.Voters[i], sub.Voters[i]
+		if m.Name != s.Name {
+			return nil, fmt.Errorf("power state voter #%d names are different. sub.V = %q, min.V = %q", i, s.Name, m.Name)
+		}
+		ps.Voters = append(ps.Voters, Voter{
+			// Name should stay the same.
+			Name: m.Name,
+
+			Time:  m.Time - s.Time,
+			Count: m.Count - s.Count,
+		})
+	}
+
+	return &ps, nil
 }
 
 // updateState method interprets the events contained in the battery history string
-// according to the definitions in:
-// android//frameworks/base/core/java/android/os/BatteryStats.java
-func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *ActivitySummary, summaries *[]ActivitySummary,
-	idxMap map[string]ServiceUID, idx, tr, key, value string) (*DeviceState, *ActivitySummary, error) {
+// according to the definitions in: frameworks/base/core/java/android/os/BatteryStats.java
+func updateState(b io.Writer, csvState *csv.State, state *DeviceState, summary *ActivitySummary, summaries *[]ActivitySummary,
+	idxMap map[string]ServiceUID, pum PackageUIDMapping, idx, tr, key, value string) (*DeviceState, *ActivitySummary, error) {
 
 	switch key {
 	case "Bs": // status
@@ -1361,13 +1685,13 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		active := summary.Active
 		ret := state.ChargingStatus.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			summary.ChargingStatusSummary, value, "Charging status", csv)
+			summary.ChargingStatusSummary, value, "Charging status", csvState)
 
 		switch value {
 		case "?": // unknown
 		case "c": // charging
 			if active && i != state.ChargingStatus {
-				state, summary = summarizeActiveState(state, summary, summaries, false, "CHARGING", csv)
+				state, summary = summarizeActiveState(state, summary, summaries, false, "CHARGING")
 				summary.Active = false
 			}
 		case "n": // not-charging
@@ -1399,26 +1723,26 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		}
 		return state, summary, state.Health.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			summary.HealthSummary, value, "Health", csv)
+			summary.HealthSummary, value, "Health", csvState)
 
 	case "Bp": // plug
 		switch value {
 		case "n": // none
 		case "a": // ac
-		case "w": // wireless
 		case "u": // usb
+		case "w": // wireless
 		default:
 			return state, summary, fmt.Errorf("unknown plug type = %q", value)
 		}
 		return state, summary, state.PlugType.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			summary.PlugTypeSummary, value, "Plug", csv)
+			summary.PlugTypeSummary, value, "Plug", csvState)
 
 	case "Bt": // temperature
-		return state, summary, state.Temperature.assign(state.CurrentTime, value, summary.Active, "Temperature", csv)
+		return state, summary, state.Temperature.assign(state.CurrentTime, value, summary.Active, "Temperature", csvState)
 
 	case "Bv": // volt
-		return state, summary, state.Voltage.assign(state.CurrentTime, value, summary.Active, "Voltage", csv)
+		return state, summary, state.Voltage.assign(state.CurrentTime, value, summary.Active, "Voltage", csvState)
 
 	case "Bl": // level
 		i := state.BatteryLevel
@@ -1426,26 +1750,25 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		if err != nil {
 			return state, summary, errors.New("parsing int error for level")
 		}
-		ret := state.BatteryLevel.assign(state.CurrentTime, value, summary.Active, "Level", csv)
+		state.lastBatteryLevel = i
+		ret := state.BatteryLevel.assign(state.CurrentTime, value, summary.Active, BatteryLevel, csvState)
 
 		summary.FinalBatteryLevel = parsedLevel
 
 		if !summary.Active || summary.InitialBatteryLevel == -1 {
 			summary.InitialBatteryLevel = parsedLevel
-		} else {
-			if summary.Active && summary.SummaryFormat == FormatBatteryLevel && i != state.BatteryLevel {
-				state, summary = summarizeActiveState(state, summary, summaries, false, "LEVEL", csv)
-			}
+		} else if summary.SummaryFormat == FormatBatteryLevel && i != state.BatteryLevel {
+			state, summary = summarizeActiveState(state, summary, summaries, false, "LEVEL")
 		}
 		return state, summary, ret
 
 	case "BP": // plugged = {+BP, -BP}
 		return state, summary, state.Plugged.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.PluggedInSummary, tr, "Plugged", csv)
+			&summary.PluggedInSummary, tr, Plugged, csvState)
 
 	case "Bcc": // coulomb charge (in mAh)
-		return state, summary, state.CoulombCharge.assign(state.CurrentTime, value, summary.Active, "Coulomb charge", csv)
+		return state, summary, state.CoulombCharge.assign(state.CurrentTime, value, summary.Active, "Coulomb charge", csvState)
 
 	case "r": // running
 		// Needs special handling as the wakeup reason will arrive asynchronously
@@ -1457,7 +1780,7 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 			// Note the time the new state starts
 			state.CPURunning.Start = state.CurrentTime
 			state.CPURunning.Value = true
-			csv.AddEntry("CPU running", &tsString{state.CPURunning.Start, ""}, state.CurrentTime)
+			csvState.AddEntry("CPU running", &tsString{state.CPURunning.Start, ""}, state.CurrentTime)
 
 			// Store the details of the last wakeup to correctly attribute wakeup reason
 			state.LastWakeupTime = state.CurrentTime
@@ -1470,36 +1793,33 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 					return state, summary, errors.New("-r received without a corresponding +r")
 				}
 				state.CPURunning.Start = summary.StartTimeMs
-				csv.AddEntry("CPU running", &tsString{state.CPURunning.Start, ""}, state.CPURunning.Start)
+				csvState.AddEntry("CPU running", &tsString{state.CPURunning.Start, ""}, state.CPURunning.Start)
 			}
-			csv.AddEntry("CPU running", &tsString{state.CPURunning.Start, state.WakeupReason.Service}, state.CurrentTime)
+			csvState.AddEntry("CPU running", &tsString{state.CPURunning.Start, state.WakeupReason.Service}, state.CurrentTime)
 			if summary.Active {
 				duration := time.Duration(state.CurrentTime-state.CPURunning.Start) * time.Millisecond
 				if duration > 0 {
-					summary.CPURunningSummary.TotalDuration += duration
-					if duration > summary.CPURunningSummary.MaxDuration {
-						summary.CPURunningSummary.MaxDuration = duration
-					}
-					summary.CPURunningSummary.Num++
+					summary.CPURunningSummary.addDuration(duration)
 				}
 			}
-			state.LastWakeupDuration = time.Duration(state.CurrentTime-state.CPURunning.Start) * time.Millisecond
+			state.LastWakeupDuration = time.Duration(state.CurrentTime-state.LastWakeupTime) * time.Millisecond
+			// Set the last wakeup time as now in case any wakeup reasons are logged after the -r. They should get a duration of 0.
+			state.LastWakeupTime = state.CurrentTime
 			// Note the time the new state starts
 			state.CPURunning.Start = state.CurrentTime
 			state.CPURunning.Value = false
 
 			// Account for wakeup reason stats
 			if state.WakeupReason.Service != "" {
+				if err := csvState.EndWakeupReason(state.WakeupReason.Service, state.CurrentTime); err != nil {
+					return state, summary, err
+				}
 				if summary.Active {
 					d := summary.WakeupReasonSummary[state.WakeupReason.Service]
 
 					duration := state.LastWakeupDuration
 					if duration > 0 {
-						d.TotalDuration += duration
-						if duration > d.MaxDuration {
-							d.MaxDuration = duration
-						}
-						d.Num++
+						d.addDuration(duration)
 						summary.WakeupReasonSummary[state.WakeupReason.Service] = d
 					}
 				}
@@ -1519,33 +1839,63 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		if !ok {
 			return state, summary, fmt.Errorf("unable to find index %q in idxMap for wakelock", value)
 		}
+		old := state.WakeupReason.Service
 		state.WakeupReason.Service = serviceUID.Service
 
-		csv.AddWakeupReason(state.WakeupReason.Service, state.CurrentTime)
+		if state.CPURunning.Value && state.LastWakeupTime != 0 && (state.WakeLockHeld.Value || old == "") {
+			// If a wakelock is curently held or there wasn't a previously saved wakeup reason,
+			// LastWakeupTime should give the time when the CPU started running.
+			csvState.StartWakeupReason(state.WakeupReason.Service, state.LastWakeupTime)
+			if state.WakeLockHeld.Value {
+				csvState.EndWakeupReason(state.WakeupReason.Service, state.WakeLockHeld.Start)
+			}
+		} else {
+			csvState.StartWakeupReason(state.WakeupReason.Service, state.CurrentTime)
+		}
 		if state.CPURunning.Value == true {
 			state.WakeupReason.Start = state.CPURunning.Start
+			endT := state.CurrentTime
+			if old == "" && state.WakeLockHeld.Value {
+				old = state.WakeupReason.Service
+				// Wakeup reason duration ends when a userspace wakelock is acquired.
+				endT = state.WakeLockHolder.Start
+				// Don't need to track this wakeup reason anymore.
+				state.WakeupReason.Service = ""
+				state.LastWakeupDuration = time.Duration(endT-state.LastWakeupTime) * time.Millisecond
+			}
+			if old != "" {
+				if summary.Active {
+					d := summary.WakeupReasonSummary[old]
+					duration := time.Duration(endT-state.LastWakeupTime) * time.Millisecond
+					d.addDuration(duration)
+					summary.WakeupReasonSummary[old] = d
+				}
+				state.LastWakeupTime = state.CurrentTime
+			}
 		} else {
 			// Wakeup reason received when CPU is not running.
 			// Summarize here based on the lastwakeuptime and lastwakeupduration
 			if state.LastWakeupTime == 0 {
+				// Wakeup reason given before a +r. That means that either the CPU is already running (we see a -r before a +r), or there's a problem (we'll see a +r before a -r)
+				// Current parsing assumes for now that it is the first case.
+				// TODO: figure out how to detect and handle the second case.
+				state.LastWakeupTime = state.CurrentTime
 				return state, summary, nil
 			}
+
 			state.WakeupReason.Start = state.LastWakeupTime
 			if summary.Active {
 				d := summary.WakeupReasonSummary[state.WakeupReason.Service]
-				duration := state.LastWakeupDuration
-				if duration > 0 {
-					d.TotalDuration += duration
-					if duration > d.MaxDuration {
-						d.MaxDuration = duration
-					}
-					d.Num++
-					summary.WakeupReasonSummary[state.WakeupReason.Service] = d
-				}
+				duration := time.Duration(state.LastWakeupTime-state.CurrentTime) * time.Millisecond
+				d.addDuration(duration)
+				summary.WakeupReasonSummary[state.WakeupReason.Service] = d
 			}
-			state.WakeupReason.Service = ""
-			state.LastWakeupTime = 0
-			state.LastWakeupDuration = 0
+			state.LastWakeupTime = state.CurrentTime
+			if state.CPURunning.Start != 0 {
+				// We've encountered a -r before. Without this check, if we see two wr events before the first -r, we'll incorrectly print out the times for the second event.
+				csvState.EndWakeupReason(state.WakeupReason.Service, state.CurrentTime)
+				state.WakeupReason.Service = ""
+			}
 		}
 
 	case "w": // wake_lock
@@ -1568,6 +1918,28 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 				// Dealing with the case where we see two consecutive +w=123, +w=456
 				return state, summary, errors.New("two holders of the wakelock?")
 			}
+			if state.WakeupReason.Service != "" {
+				// Wakeup reason stats in checkin data count the amount of time between the wakeup
+				// from suspend and the acquiring of the first wakelock by userspace. So if there was a
+				// wakeup reason being tracked, mark this wakelock acquisition as the end of the wakeup reason duration.
+				if err := csvState.EndWakeupReason(state.WakeupReason.Service, state.CurrentTime); err != nil {
+					return state, summary, err
+				}
+				if summary.Active {
+					d := summary.WakeupReasonSummary[state.WakeupReason.Service]
+
+					duration := state.LastWakeupDuration
+					if duration == 0 {
+						duration = time.Duration(state.CurrentTime-state.LastWakeupTime) * time.Millisecond
+					}
+					d.addDuration(duration)
+					summary.WakeupReasonSummary[state.WakeupReason.Service] = d
+				}
+				state.WakeupReason.Service = ""
+				// There was previously a wakeup reason keeping the CPU awake. Set the last wakeup time to now so that any
+				// wr=* the same line as this +w will not get the incorrect duration.
+				state.LastWakeupTime = state.CurrentTime
+			}
 			if value == "" {
 				// Dealing with the case where we see a +w for the first time
 				// The entity was already active when the summary was taken,
@@ -1586,6 +1958,8 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 			state.WakeLockHolder.Start = state.CurrentTime
 			state.WakeLockHeld = tsBool{Start: state.CurrentTime, Value: true}
 		case "-":
+			// For any wakeup reasons that are given after the wakelock is released.
+			state.LastWakeupTime = state.CurrentTime
 			if !state.WakeLockHeld.Value {
 				// There was no + transition for this.
 				// This is the case where a -w appears in the middle of a report,
@@ -1594,18 +1968,14 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 				// +w without a value would be present and is handled above.
 				state.WakeLockHolder.Start = state.CurrentTime
 				state.WakeLockHolder.Service = "unknown-wakelock-holder"
-				addCSVInstantEvent(csv, state, "Partial wakelock", "error", `"missing corresponding +w"`)
+				addCSVInstantEvent(csvState, state, "Partial wakelock", "error", `"missing corresponding +w"`)
 				return state, summary, nil
 			}
 			if summary.Active {
 				d := summary.WakeLockSummary[state.WakeLockHolder.Service]
 				duration := time.Duration(state.CurrentTime-state.WakeLockHolder.Start) * time.Millisecond
 				if duration > 0 {
-					d.TotalDuration += duration
-					if duration > d.MaxDuration {
-						d.MaxDuration = duration
-					}
-					d.Num++
+					d.addDuration(duration)
 					summary.WakeLockSummary[state.WakeLockHolder.Service] = d
 				}
 			}
@@ -1614,17 +1984,17 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		default:
 			return state, summary, fmt.Errorf("unknown transition for wakelock : %q", tr)
 		}
-		csv.AddEntry("Partial wakelock", &state.WakeLockHolder, state.CurrentTime)
+		csvState.AddEntry("Partial wakelock", &state.WakeLockHolder, state.CurrentTime)
 
 	case "g": // gps
 		return state, summary, state.GpsOn.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.GpsOnSummary, tr, "GPS", csv)
+			&summary.GpsOnSummary, tr, "GPS", csvState)
 
 	case "s": // sensor
 		return state, summary, state.SensorOn.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.SensorOnSummary, tr, "Sensor", csv)
+			&summary.SensorOnSummary, tr, "Sensor", csvState)
 
 	case "Esw": // screen wake reason
 		if state.ScreenOn.Value && state.ScreenOn.Start > 0 && state.ScreenOn.data != unknownScreenOnReason {
@@ -1646,15 +2016,16 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 			return state, summary, err
 		}
 
-		state.ScreenOn.data = suid.Service                         // Need to set the ScreenOn.data field so the csv is printed out correctly
-		csv.AddOptToEntry("Screen", &state.ScreenOn, suid.Service) // Overwrite the +S csv entry opt field to ensure output csv is correct
+		state.ScreenOn.data = suid.Service                              // Need to set the ScreenOn.data field so the csv is printed out correctly
+		csvState.AddOptToEntry("Screen", &state.ScreenOn, suid.Service) // Overwrite the +S csv entry opt field to ensure output csv is correct
 		return state, summary, nil
 
 	case "S": // screen
 		prevVal := state.ScreenOn.Value
 		err := state.ScreenOn.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.ScreenOnSummary, tr, "Screen", csv)
+			&summary.ScreenOnSummary, tr, "Screen", csvState)
+
 		if tr == "-" {
 			// Reset data on screen off transition so we don't carry over reasons to other screen on events
 			state.ScreenOn.data = unknownScreenOnReason
@@ -1663,7 +2034,7 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 			return state, summary, err
 		}
 		// Update state for the top app.
-		topAppSuid, err := topApp(state.TopApplicationMap)
+		topAppSuid, err := state.topApp()
 		if err != nil || topAppSuid == nil {
 			return state, summary, err
 		}
@@ -1676,32 +2047,32 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 			topAppSuid.addSummaryEntry(state.CurrentTime, topAppSuid, summary.TopApplicationSummary)
 		}
 		// Add 'Top app' entry to the log and update the start time.
-		csv.AddEntryWithOpt("Top app", topAppSuid, state.CurrentTime, fmt.Sprint(appID))
+		csvState.AddEntryWithOpt(Top, topAppSuid, state.CurrentTime, fmt.Sprint(appID))
 		topAppSuid.Start = state.CurrentTime
-		return state, summary, err
+		return state, summary, nil
 
 	case "Sb": // brightness
-		return state, summary, state.Brightness.assign(state.CurrentTime, value, summary.Active, "Brightness", csv)
+		return state, summary, state.Brightness.assign(state.CurrentTime, value, summary.Active, "Brightness", csvState)
 
 	case "Pcl": // phone_in_call
 		return state, summary, state.PhoneInCall.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.PhoneCallSummary, tr, "Phone call", csv)
+			&summary.PhoneCallSummary, tr, "Phone call", csvState)
 
 	case "Pcn": // data_conn
 		return state, summary, state.DataConnection.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			summary.DataConnectionSummary, value, "Mobile network type", csv)
+			summary.DataConnectionSummary, value, "Mobile network type", csvState)
 
 	case "Pr": // modile_radio
 		return state, summary, state.MobileRadioOn.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.MobileRadioOnSummary, tr, "Mobile radio active", csv)
+			&summary.MobileRadioOnSummary, tr, "Mobile radio active", csvState)
 
 	case "Psc": // phone_scanning
 		return state, summary, state.PhoneScanning.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.PhoneScanSummary, tr, "Phone scanning", csv)
+			&summary.PhoneScanSummary, tr, "Phone scanning", csvState)
 
 	case "Pss": // phone_signal_strength
 		signalValue, ok := signalStrengthConstants[value]
@@ -1710,7 +2081,7 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		}
 		return state, summary, state.PhoneSignalStrength.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs, summary.PhoneSignalStrengthSummary,
-			signalValue, "Mobile signal strength", csv)
+			signalValue, "Mobile signal strength", csvState)
 
 	case "Pst": // phone_state
 		switch value {
@@ -1721,18 +2092,18 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 			// Phone went off. Make sure the signal strength metric is updated accordingly.
 			state.PhoneSignalStrength.assign(state.CurrentTime,
 				summary.Active, summary.StartTimeMs, summary.PhoneSignalStrengthSummary,
-				"none", "Mobile signal strength", csv)
+				"none", "Mobile signal strength", csvState)
 		default:
 			return state, summary, fmt.Errorf("unknown phone state = %q", value)
 		}
 		return state, summary, state.PhoneState.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			summary.PhoneStateSummary, value, "Phone state", csv)
+			summary.PhoneStateSummary, value, "Phone state", csvState)
 
 	case "bles": // ble_scanning
 		return state, summary, state.BLEScanning.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.BLEScanSummary, tr, "BLE scanning", csv)
+			&summary.BLEScanSummary, tr, "BLE scanning", csvState)
 
 	case "Enl": // null
 		return state, summary, errors.New("sample: Null Event line = " + tr + key + value)
@@ -1744,7 +2115,7 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		}
 		return state, summary, serviceUID.assign(state.CurrentTime,
 			summary.Active, true, summary.StartTimeMs, state.ActiveProcessMap,
-			summary.ActiveProcessSummary, tr, value, "Active process", csv)
+			summary.ActiveProcessSummary, tr, value, "Active process", csvState)
 
 	case "Efg": // fg
 		serviceUID, ok := idxMap[value]
@@ -1753,7 +2124,7 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		}
 		return state, summary, serviceUID.assign(state.CurrentTime,
 			summary.Active, true, summary.StartTimeMs, state.ForegroundProcessMap,
-			summary.ForegroundProcessSummary, tr, value, "Foreground process", csv)
+			summary.ForegroundProcessSummary, tr, value, Foreground, csvState)
 
 	case "Etp": // top
 		serviceUID, ok := idxMap[value]
@@ -1762,7 +2133,7 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		}
 		return state, summary, serviceUID.assign(state.CurrentTime,
 			summary.Active, state.ScreenOn.Value, summary.StartTimeMs, state.TopApplicationMap,
-			summary.TopApplicationSummary, tr, value, "Top app", csv)
+			summary.TopApplicationSummary, tr, value, Top, csvState)
 
 	case "Esy": // sync
 		serviceUID, ok := idxMap[value]
@@ -1778,40 +2149,40 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 				start = state.AppSyncingMap[value].Start
 			}
 			if summary.Active {
-				i := interval{start, state.CurrentTime}
+				i := csv.Event{Start: start, End: state.CurrentTime}
 				state.syncIntervals = append(state.syncIntervals, i)
 			}
 		}
 
 		return state, summary, serviceUID.assign(state.CurrentTime,
 			summary.Active, true, summary.StartTimeMs, state.AppSyncingMap,
-			summary.PerAppSyncSummary, tr, value, "SyncManager", csv)
+			summary.PerAppSyncSummary, tr, value, "SyncManager", csvState)
 
 	case "W": // wifi
 		if tr == "-" {
 			// Wifi went off. Make sure the signal strength metric is updated accordingly.
 			state.WifiSignalStrength.assign(state.CurrentTime,
 				summary.Active, summary.StartTimeMs, summary.WifiSignalStrengthSummary,
-				"none", "Wifi signal strength", csv)
+				"none", "Wifi signal strength", csvState)
 		}
 		return state, summary, state.WifiOn.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.WifiOnSummary, tr, "Wifi on", csv)
+			&summary.WifiOnSummary, tr, "Wifi on", csvState)
 
 	case "Wl": // wifi_full_lock
 		return state, summary, state.WifiFullLock.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.WifiFullLockSummary, tr, "Wifi full lock", csv)
+			&summary.WifiFullLockSummary, tr, "Wifi full lock", csvState)
 
 	case "Ws": // wifi_scan
 		return state, summary, state.WifiScan.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.WifiScanSummary, tr, "Wifi scan", csv)
+			&summary.WifiScanSummary, tr, "Wifi scan", csvState)
 
 	case "Wm": // wifi_multicast
 		return state, summary, state.WifiMulticastOn.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.WifiMulticastOnSummary, tr, "Wifi multicast", csv)
+			&summary.WifiMulticastOnSummary, tr, "Wifi multicast", csvState)
 
 	case "Wr": // wifi_radio
 		// Temporary workaround to disambiguate Wr
@@ -1819,35 +2190,35 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 			// WifI Lock
 			return state, summary, state.WifiRadio.assign(state.CurrentTime,
 				summary.Active, summary.StartTimeMs,
-				&summary.WifiRadioSummary, tr, "Wifi radio", csv)
+				&summary.WifiRadioSummary, tr, "Wifi radio", csvState)
 		}
 
 	case "Ww": // wifi_running
 		return state, summary, state.WifiRunning.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.WifiRunningSummary, tr, "Wifi running", csv)
+			&summary.WifiRunningSummary, tr, "Wifi running", csvState)
 
 	case "lp", "ps": // Low power mode was renamed to power save mode in M
 		return state, summary, state.LowPowerModeOn.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.LowPowerModeOnSummary, tr, "Battery Saver", csv)
+			&summary.LowPowerModeOnSummary, tr, "Battery Saver", csvState)
 
 	case "a": // audio
 		return state, summary, state.AudioOn.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.AudioOnSummary, tr, "Audio", csv)
+			&summary.AudioOnSummary, tr, "Audio", csvState)
 
 	case "ca": // camera
 		return state, summary, state.CameraOn.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.CameraOnSummary, tr, "Camera", csv)
+			&summary.CameraOnSummary, tr, "Camera", csvState)
 
 	case "v": // video
 		return state, summary, state.VideoOn.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.VideoOnSummary, tr, "Video", csv)
+			&summary.VideoOnSummary, tr, "Video", csvState)
 
-	case "Ecn":
+	case "Ecn": // network connectivity
 		suid := idxMap[value]
 		t, ok := connConstants[suid.UID]
 		if !ok {
@@ -1872,11 +2243,7 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 				if summary.Active {
 					duration := time.Duration(state.CurrentTime-activeNtwks[tmp].Start) * time.Millisecond
 					if duration > 0 {
-						d.TotalDuration += duration
-						if duration > d.MaxDuration {
-							d.MaxDuration = duration
-						}
-						d.Num++
+						d.addDuration(duration)
 						ntwkSummary[tmp] = d
 					}
 				}
@@ -1886,7 +2253,7 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 					Service: tmp,
 					UID:     suid.UID,
 				}
-				csv.AddEntry("Network connectivity", su, state.CurrentTime)
+				csvState.AddEntry("Network connectivity", su, state.CurrentTime)
 			}
 			suid.Start = state.CurrentTime
 			activeNtwks[ts] = &suid
@@ -1915,17 +2282,13 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 					Service: ts,
 					UID:     suid.UID,
 				}
-				csv.AddEntry("Network connectivity", su, suid.Start)
+				csvState.AddEntry("Network connectivity", su, suid.Start)
 			}
 
 			if summary.Active {
 				duration := time.Duration(state.CurrentTime-activeNtwks[ts].Start) * time.Millisecond
 				if duration > 0 {
-					d.TotalDuration += duration
-					if duration > d.MaxDuration {
-						d.MaxDuration = duration
-					}
-					d.Num++
+					d.addDuration(duration)
 					ntwkSummary[ts] = d
 				}
 			}
@@ -1960,17 +2323,13 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 					Service: tmp,
 					UID:     suid.UID,
 				}
-				csv.AddEntry("Network connectivity", su, suid.Start)
+				csvState.AddEntry("Network connectivity", su, suid.Start)
 			}
 			d := ntwkSummary[tmp]
 			if summary.Active {
 				duration := time.Duration(state.CurrentTime-activeNtwks[tmp].Start) * time.Millisecond
 				if duration > 0 {
-					d.TotalDuration += duration
-					if duration > d.MaxDuration {
-						d.MaxDuration = duration
-					}
-					d.Num++
+					d.addDuration(duration)
 					ntwkSummary[tmp] = d
 				}
 			}
@@ -1980,7 +2339,7 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 				Service: tmp,
 				UID:     suid.UID,
 			}
-			csv.AddEntry("Network connectivity", su, state.CurrentTime)
+			csvState.AddEntry("Network connectivity", su, state.CurrentTime)
 
 			suid.Start = state.CurrentTime
 			activeNtwks[ts] = &suid
@@ -1994,7 +2353,7 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 			Service: ts,
 			UID:     suid.UID,
 		}
-		csv.AddEntry("Network connectivity", su, state.CurrentTime)
+		csvState.AddEntry("Network connectivity", su, state.CurrentTime)
 
 	case "Ewl": // wakelock_in
 		serviceUID, ok := idxMap[value]
@@ -2003,9 +2362,9 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		}
 		return state, summary, serviceUID.assign(state.CurrentTime,
 			summary.Active, true, summary.StartTimeMs, state.WakeLockMap,
-			summary.WakeLockDetailedSummary, tr, value, "Wakelock_in", csv)
+			summary.WakeLockDetailedSummary, tr, value, "Wakelock_in", csvState)
 
-	case "di": // device idle mode of M
+	case "di": // Doze mode
 		if value == "" { // This will be the case for histories from M devices.
 			switch tr {
 			case "+":
@@ -2026,10 +2385,10 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 				}
 				// Mark it as being in the opposite state from the beginning.
 				state.IdleMode.Start = summary.StartTimeMs
-				csv.AddEntry("Doze", &state.IdleMode, summary.StartTimeMs)
+				csvState.AddEntry("Doze", &state.IdleMode, summary.StartTimeMs)
 				state.IdleMode.assign(state.CurrentTime,
 					summary.Active, summary.StartTimeMs,
-					summary.IdleModeSummary, value, "Doze", csv)
+					summary.IdleModeSummary, value, "Doze", csvState)
 			}
 		} else if state.IdleMode.Value == "" && value == "off" {
 			// value will be non-empty for histories from N+ devices.
@@ -2037,10 +2396,10 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 			// Mark it as being unknown from the beginning.
 			state.IdleMode.Value = "unknown"
 			state.IdleMode.Start = summary.StartTimeMs
-			csv.AddEntry("Doze", &state.IdleMode, summary.StartTimeMs)
+			csvState.AddEntry("Doze", &state.IdleMode, summary.StartTimeMs)
 			state.IdleMode.assign(state.CurrentTime,
 				summary.Active, summary.StartTimeMs,
-				summary.IdleModeSummary, value, "Doze", csv)
+				summary.IdleModeSummary, value, "Doze", csvState)
 		}
 		var err error
 		if value == "???" {
@@ -2050,7 +2409,7 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		}
 		state.IdleMode.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			summary.IdleModeSummary, value, "Doze", csv)
+			summary.IdleModeSummary, value, "Doze", csvState)
 		return state, summary, err
 
 	case "Ejb": // job: an application executing a scheduled job
@@ -2060,7 +2419,21 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		}
 		return state, summary, serviceUID.assign(state.CurrentTime,
 			summary.Active, true, summary.StartTimeMs, state.ScheduledJobMap,
-			summary.ScheduledJobSummary, tr, value, "JobScheduler", csv)
+			summary.ScheduledJobSummary, tr, value, "JobScheduler", csvState)
+
+	case "Elw": // longwake: long-held wakelocks
+		serviceUID, ok := idxMap[value]
+		if !ok {
+			return state, summary, fmt.Errorf("unable to find index %q in idxMap for longwake", value)
+		}
+		curTime := state.CurrentTime
+		if tr == "+" {
+			// Include the minute that the wakelock was held before it was logged in the history.
+			curTime = state.CurrentTime - int64(time.Minute/time.Millisecond)
+		}
+		return state, summary, serviceUID.assign(curTime,
+			summary.Active, true, summary.StartTimeMs, state.LongWakelockMap,
+			summary.LongWakelockSummary, tr, value, LongWakelocks, csvState)
 
 	case "Etw": // tmpwhitelist: an application on the temporary whitelist
 		// Etw events log apps going on/off the temporary whitelist, for example when GCM delivers a high priority message to the app and temporarily whitelists it for network access
@@ -2070,7 +2443,7 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		}
 		return state, summary, serviceUID.assign(state.CurrentTime,
 			summary.Active, true, summary.StartTimeMs, state.TmpWhiteListMap,
-			summary.TmpWhiteListSummary, tr, value, "Temp White List", csv)
+			summary.TmpWhiteListSummary, tr, value, "Temp White List", csvState)
 
 	case "Wsp": // Wifi Supplicant
 		switch value {
@@ -2082,7 +2455,7 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		}
 		return state, summary, state.WifiSuppl.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			summary.WifiSupplSummary, value, "Wifi supplicant", csv)
+			summary.WifiSupplSummary, value, "Wifi supplicant", csvState)
 
 	case "Wss": // WiFi Signal Strength
 		signalValue, ok := signalStrengthConstants[value]
@@ -2091,12 +2464,12 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		}
 		return state, summary, state.WifiSignalStrength.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs, summary.WifiSignalStrengthSummary,
-			signalValue, "Wifi signal strength", csv)
+			signalValue, "Wifi signal strength", csvState)
 
 	case "fl": // flashlight
 		return state, summary, state.FlashlightOn.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.FlashlightOnSummary, tr, "Flashlight on", csv)
+			&summary.FlashlightOnSummary, tr, "Flashlight on", csvState)
 
 	case "ch": // charging
 		// The "ch" bit is whether the device currently considers itself to be charging, which may not
@@ -2104,28 +2477,33 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		// power that the battery is actually draining, charging will not be set (-ch).
 		return state, summary, state.ChargingOn.assign(state.CurrentTime,
 			summary.Active, summary.StartTimeMs,
-			&summary.ChargingOnSummary, tr, "Charging on", csv)
+			&summary.ChargingOnSummary, tr, Charging, csvState)
 
 	case "Epi": // pkginst: package being installed, regardless of whether an older version of
-		return state, summary, addCSVInstantAppEvent(csv, state, idxMap, "Package install", value)
+		return state, summary, addCSVInstantAppEvent(csvState, state, idxMap, "Package install", value)
 
 	case "Epu": // pkgunin: package being uninstalled, applys to updates as well.
-		return state, summary, addCSVInstantAppEvent(csv, state, idxMap, "Package uninstall", value)
+		return state, summary, addCSVInstantAppEvent(csvState, state, idxMap, "Package uninstall", value)
 
 	case "Esm": // significant motion
 		// Significant Motion Detection is a state change event that is added to CSV as a point event without a duration.
-		addCSVInstantEvent(csv, state, "Significant motion", "bool", "true")
+		addCSVInstantEvent(csvState, state, "Significant motion", "bool", "true")
+		return state, summary, nil
+
+	case "Ewa": // wakeup AP: a UID caused the application processor to wakeup.
+		// This can be caused by either +mobile-radio or +wifi, but those don't have to be on the same history line.
+		addCSVInstantAppEvent(csvState, state, idxMap, "App Processor wakeup", value)
 		return state, summary, nil
 
 	case "Eaa": // package active. Event for a package becoming active due to an interaction.
-		return state, summary, addCSVInstantAppEvent(csv, state, idxMap, "Package active", value)
+		return state, summary, addCSVInstantAppEvent(csvState, state, idxMap, "Package active", value)
 
 	case "Eac": // device active, like turning the screen on or plugging in to power
-		addCSVInstantEvent(csv, state, "Device active", "bool", "true")
+		addCSVInstantEvent(csvState, state, "Device active", "bool", "true")
 		return state, summary, nil
 
 	case "Eai": // package inactive. Event for a package becoming inactive due to being unused for a period of time.
-		return state, summary, addCSVInstantAppEvent(csv, state, idxMap, "Package inactive", value)
+		return state, summary, addCSVInstantAppEvent(csvState, state, idxMap, "Package inactive", value)
 
 	case "Eal": // alarm
 		// "Eal" is an alarm going off event. These are all from alarms scheduled by apps with the AlarmManager.
@@ -2134,7 +2512,7 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		if !ok {
 			return state, summary, fmt.Errorf("unable to find index %q in idxMap for Alarm going off (Eal)", value)
 		}
-		err := suid.assign(state.CurrentTime, summary.Active, true, summary.StartTimeMs, state.AlarmMap, summary.AlarmSummary, tr, value, "Alarm", csv)
+		err := suid.assign(state.CurrentTime, summary.Active, true, summary.StartTimeMs, state.AlarmMap, summary.AlarmSummary, tr, value, "Alarm", csvState)
 		return state, summary, err
 
 	case "Est": // stats
@@ -2164,7 +2542,7 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		if dcpu.Start == 0 {
 			dcpu.Start = summary.StartTimeMs
 		}
-		dcpu.BatteryLevel = state.BatteryLevel.Value + 1 // +1 is to make BatteryLevel the starting battery level
+		dcpu.BatteryLevel = state.lastBatteryLevel.Value
 		dcpu.Duration = time.Duration(state.CurrentTime-dcpu.Start) * time.Millisecond
 
 		// parse the value into different tokens
@@ -2186,14 +2564,23 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 				dcpu.SystemTime = time.Duration(s[1]) * time.Millisecond
 			case 1, 2, 3:
 				app := AppCPUUsage{
+					start:      state.lastBatteryLevel.Start,
 					UID:        ss[0],
 					UserTime:   time.Duration(s[1]) * time.Millisecond,
 					SystemTime: time.Duration(s[2]) * time.Millisecond,
 				}
+				appID, err := packageutils.AppIDFromString(app.UID)
+				if err != nil {
+					return state, summary, err
+				}
+				app.pkgName = pum.packageName(appID)
+				// The implementation of addEntryWithOpt requires two calls in order for the csv line to be printed out.
+				csvState.AddEntryWithOpt("Highest App CPU Usage", &app, app.start, fmt.Sprint(appID))
+				csvState.AddEntryWithOpt("Highest App CPU Usage", &app, state.CurrentTime, fmt.Sprint(appID))
 				dcpu.CPUUtilizers = append(dcpu.CPUUtilizers, app)
 				calDcpuOverallSummary(ss[0], s[1], s[2], summary.DcpuOverallSummary, summary.Active)
 			default:
-				return state, summary, fmt.Errorf("unknown Dcpu part = %q", value)
+				return state, summary, fmt.Errorf("unknown Dcpu part: %q", sub)
 			}
 		}
 		state.DcpuStats = dcpu
@@ -2223,10 +2610,84 @@ func updateState(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		state.dpstTokenIndex = 1
 		return state, summary, nil
 
+	// low power states...unfortunately, there's no real key in the checkin format of the history,
+	// so we have to look for these instead
+	case "null":
+		// The system doesn't support this hardware for low power states. Nothing to do here.
+	case "state_1":
+		pStates, err := parsePowerStates(value)
+		if err != nil {
+			return state, summary, err
+		}
+
+		if len(state.CummulativePowerState) == 0 {
+			// This is the first log we see for power states.
+			// This could potentially include data from before the batterystats was reset,
+			// so not saving it as the stats for the previous drop.
+			for _, p := range pStates {
+				p.start = summary.StartTimeMs
+				state.CummulativePowerState[p.Name] = p
+				state.InitialPowerState[p.Name] = p
+			}
+			// Start & end times don't really matter for groups.
+			csvState.PrintInstantEvent(rpmStatsGroupEntry(pStates))
+			return state, summary, nil
+		}
+
+		// Numbers are stored as aggregates since boot, so we need to subtract to get the stats for the last discharge step.
+		for _, p := range pStates {
+			pc, ok := state.CummulativePowerState[p.Name]
+			if !ok {
+				// All the states should be printed out all the time,
+				// so this shouldn't happen since we check for an empty map above.
+				return state, summary, fmt.Errorf("device state cummulative power state map doesn't include %q", p.Name)
+			}
+
+			pd, err := subtractPowerStates(p, pc)
+			if err != nil {
+				return state, summary, err
+			}
+			s := summary
+			if summary.Active && summary.SummaryFormat == FormatBatteryLevel && len(*summaries) > 0 {
+				// Power state info for a specific level drop (eg. 87% -> 86%) is printed out after the battery
+				// level has changed in the log. Given that, if the format is by battery level, the 'summary'
+				// variable will point to the summary for the new level drop (eg. 86% -> 85%), so we need to
+				// get the previous summary from the list of summaries.
+				s = &(*summaries)[len(*summaries)-1]
+			}
+			pd.batteryLevel = state.lastBatteryLevel.Value
+			pd.start = state.lastBatteryLevel.Start
+			if err = s.appendPowerState(pd); err != nil {
+				return state, summary, err
+			}
+			// The implementation of AddEntry requires two calls in order for the csv line to be printed out.
+			csvState.AddEntry("Low Power State", pd, state.CurrentTime)
+			csvState.AddEntry("Low Power State", pd, state.CurrentTime)
+		}
+
+		// Update cummulative map to prepare for next discharge step.
+		for _, p := range pStates {
+			state.CummulativePowerState[p.Name] = p
+			// Subtract the initial value to make sure each timeline entry is relative to 0.
+			pt, err := subtractPowerStates(p, state.InitialPowerState[p.Name])
+			if err != nil {
+				return state, summary, err
+			}
+			pt.start = state.CurrentTime
+			for _, ve := range pt.csvLogVoterEntries() {
+				csvState.PrintInstantEvent(ve)
+			}
+			// Print out the timer lines so we can graph it in the timeline
+			pdt := &powerStateTimer{*pt}
+			csvState.AddEntry(pdt.Name, pdt, state.CurrentTime)
+			csvState.AddEntry(pdt.Name, pdt, state.CurrentTime)
+		}
+
+		return state, summary, nil
+
 	// TODO:
 	case "Eur":
 	case "Euf":
-	case "state_1":
 
 	default:
 		// Handle Dpst Event
@@ -2278,6 +2739,7 @@ func addCSVInstantAppEvent(csv *csv.State, state *DeviceState, idxMap map[string
 		return fmt.Errorf("unable to find index %q in idxMap for %q", value, eventName)
 	}
 	var appID int32
+	s := suid.Service
 	if suid.Pkg == nil {
 		var err error
 		appID, err = packageutils.AppIDFromString(suid.UID)
@@ -2286,10 +2748,15 @@ func addCSVInstantAppEvent(csv *csv.State, state *DeviceState, idxMap map[string
 		}
 	} else {
 		appID = suid.Pkg.GetUid()
+		if s == "" || s == `""` {
+			// The current regex will include "" in the service string. Removing it will be a large change.
+			// TODO: determine if it's better to keep the quotes in the struct representation or not.
+			s = fmt.Sprintf(`%q`, suid.Pkg.GetPkgName())
+		}
 	}
 	e := ServiceUID{
 		Start:   state.CurrentTime,
-		Service: suid.Service,
+		Service: s,
 		UID:     suid.UID,
 	}
 	// The implementation of addEntryWithOpt requires two calls in order for the csv line to be printed out.
@@ -2307,6 +2774,7 @@ func addCSVInstantEvent(csvState *csv.State, state *DeviceState, eventName, even
 		Value: value,
 	})
 }
+
 func calDcpuOverallSummary(uid string, usrTime, sysTime int, dcpuOverallMap map[string]time.Duration, summaryActive bool) {
 	if summaryActive {
 		dcpuOverallMap[uid] += time.Duration(usrTime+sysTime) * time.Millisecond
@@ -2321,7 +2789,7 @@ func printDebugEvent(b io.Writer, event, line string, state *DeviceState, summar
 }
 
 func analyzeData(b io.Writer, csv *csv.State, state *DeviceState, summary *ActivitySummary, summaries *[]ActivitySummary,
-	idxMap map[string]ServiceUID, line string) (*DeviceState, *ActivitySummary, error) {
+	idxMap map[string]ServiceUID, pum PackageUIDMapping, line string) (*DeviceState, *ActivitySummary, error) {
 
 	/*
 	  8,h,60012:START
@@ -2343,7 +2811,7 @@ func analyzeData(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		// Reset state and summary and start from scratch, History string pool
 		// is still valid as we just read it
 		if summary.StartTimeMs > 0 {
-			state, summary = summarizeActiveState(state, summary, summaries, true, "RESET", csv)
+			state, summary = summarizeActiveState(state, summary, summaries, true, "RESET")
 		}
 		summary.StartTimeMs = parsedInt64
 		summary.EndTimeMs = parsedInt64
@@ -2380,7 +2848,7 @@ func analyzeData(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		// printDebugEvent("START", line, state, summary)
 		// Reset state and summary and start from scratch, History string pool
 		// is still valid as we just read it
-		state, summary = summarizeActiveState(state, summary, summaries, true, "START", csv)
+		state, summary = summarizeActiveState(state, summary, summaries, true, "START")
 		return state, summary, nil
 	}
 
@@ -2430,10 +2898,15 @@ func analyzeData(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 		success := true
 		var errorBuffer bytes.Buffer
 		for _, part := range parts[3:] {
+			var err error
 			if matches, result := historianutils.SubexpNames(DataRE, part); matches {
-				var err error
-				state, summary, err = updateState(b, csv, state, summary, summaries, idxMap, timeDelta,
-					result["transition"], result["key"], result["value"])
+				v := result["value"]
+				if result["key"] == "state_1" {
+					// DataRE doesn't get the rest of the output because it doesn't expect spaces.
+					v = part
+				}
+				state, summary, err = updateState(b, csv, state, summary, summaries, idxMap, pum, timeDelta,
+					result["transition"], result["key"], v)
 				if err != nil {
 					success = false
 					errorBuffer.WriteString("** Error in " + line + " with " + part + " : " + err.Error() + "\n")
@@ -2452,7 +2925,7 @@ func analyzeData(b io.Writer, csv *csv.State, state *DeviceState, summary *Activ
 
 // analyzeHistoryLine takes a battery history event string and updates the device state.
 func analyzeHistoryLine(b io.Writer, csvState *csv.State, state *DeviceState, summary *ActivitySummary,
-	summaries *[]ActivitySummary, idxMap map[string]ServiceUID, upm PackageUIDMapping,
+	summaries *[]ActivitySummary, idxMap map[string]ServiceUID, pum PackageUIDMapping,
 	d *deltaMapping, line string, scrubPII bool) (*DeviceState, *ActivitySummary, error) {
 
 	if match, result := historianutils.SubexpNames(GenericHistoryStringPoolLineRE, line); match {
@@ -2465,11 +2938,11 @@ func analyzeHistoryLine(b io.Writer, csvState *csv.State, state *DeviceState, su
 			Service: service,
 			UID:     result["uid"],
 		}
-		err := upm.matchServiceWithPackageInfo(&suid)
+		err := pum.matchServiceWithPackageInfo(&suid)
 		idxMap[index] = suid
 		return state, summary, err
 	} else if match, result := historianutils.SubexpNames(GenericHistoryLineRE, line); match {
-		state, summary, err := analyzeData(b, csvState, state, summary, summaries, idxMap, line)
+		state, summary, err := analyzeData(b, csvState, state, summary, summaries, idxMap, pum, line)
 		// Add a mapping from the timestamp to current cumulative delta.
 		// If there was no valid delta, don't add a mapping.
 		timeDelta := result["timeDelta"]
@@ -2505,7 +2978,7 @@ type AnalysisReport struct {
 	OutputBuffer      bytes.Buffer
 	IdxMap            map[string]ServiceUID
 	Errs              []error
-	Overflow          bool
+	OverflowMs        int64
 	// The keys are the unix timestamp in ms, and the values are the human readable time deltas.
 	TimeToDelta map[string]string
 }
@@ -2618,7 +3091,7 @@ func BatteryLevelSummariesToCSV(buf io.Writer, summaries *[]ActivitySummary, pri
 // AnalyzeHistory takes as input a complete history log and desired summary format.
 // It then analyzes the log line by line (delimited by newline characters).
 // No summaries (before an OVERFLOW line) are excluded/filtered out.
-func AnalyzeHistory(csvWriter io.Writer, history, format string, upm PackageUIDMapping, scrubPII bool) *AnalysisReport {
+func AnalyzeHistory(csvWriter io.Writer, history, format string, pum PackageUIDMapping, scrubPII bool) *AnalysisReport {
 	// 8,hsp,0,10073,"com.google.android.volta"
 	// 8,hsp,28,0,"200:qcom,smd-rpm:203:fc4281d0.qcom,mpm:222:fc4cf000.qcom,spmi"
 
@@ -2643,13 +3116,16 @@ func AnalyzeHistory(csvWriter io.Writer, history, format string, upm PackageUIDM
 	csvState := csv.NewState(writer, true)
 	var b bytes.Buffer
 	var v int32
-	overflow := false
+	overflowIdx := -1
+	var overflowMs int64
 
 	d := newDeltaMapping()
 
-	for _, line := range h {
+	for i, line := range h {
 		if OverflowRE.MatchString(line) {
-			overflow = true
+			overflowIdx = i
+			// There can be multiple overflow events, but we only care about plotting the first one.
+			overflowMs = deviceState.CurrentTime
 			// Stop summary as soon as you OVERFLOW
 			break
 		}
@@ -2661,16 +3137,46 @@ func AnalyzeHistory(csvWriter io.Writer, history, format string, upm PackageUIDM
 			}
 			v = int32(p)
 		} else {
-			deviceState, summary, err = analyzeHistoryLine(&b, csvState, deviceState, summary, &summaries, idxMap, upm, d, line, scrubPII)
+			deviceState, summary, err = analyzeHistoryLine(&b, csvState, deviceState, summary, &summaries, idxMap, pum, d, line, scrubPII)
 			if err != nil && len(line) > 0 {
 				errs = append(errs, err)
 			}
 		}
 	}
+
+	if overflowIdx >= 0 {
+		// All battery level events are still reported after overflow.
+		es, lErrs := extractLevel(h[overflowIdx+1:], deviceState.CurrentTime, d)
+		if len(lErrs) > 0 {
+			errs = append(errs, lErrs...)
+		}
+		// End any existing battery level event using the start time of the first battery level event
+		// after overflow. This needs to be done before PrintAllReset, as otherwise that would end the
+		// battery level event at the time of overflow.
+		// e.g.
+		//   "9,h,0:RESET:TIME:1400000000000",
+		//   "9,h,0,Bl=52",
+		//   "9,h,0:*OVERFLOW*",
+		//   "9,h,1000,Bl=51,Bt=236,Bv=3820,Pss=3,w=14,wr=18,+Esy=10",
+		// should result in 2 entries:
+		//   "Level,int,1400000000000,1400000001000,52,"  // End time equal Bl=51 event start time.
+		//   "Level,int,1400000001000,1400000001000,51,"
+		//
+		// If there were no level events after overflow, that means overflow was the very last event,
+		// and PrintAllReset will end any existing battery level event at the correct time.
+		if len(es) > 0 && csvState.HasEvent(BatteryLevel, "") {
+			csvState.EndEvent(BatteryLevel, "", es[0].Start)
+		}
+		// This may lead to CSV events being unordered, but we sort events on the JS side anyway.
+		for _, e := range es {
+			csvState.PrintEvent(BatteryLevel, e)
+		}
+	}
+
 	csvState.PrintAllReset(deviceState.CurrentTime)
 	csvState.PrintRebootEvent(deviceState.CurrentTime)
 	if summary.Active {
-		deviceState, summary = summarizeActiveState(deviceState, summary, &summaries, true, "END", csvState)
+		deviceState, summary = summarizeActiveState(deviceState, summary, &summaries, true, "END")
 	}
 
 	// csv generation must go after analyzing the history lines
@@ -2685,9 +3191,32 @@ func AnalyzeHistory(csvWriter io.Writer, history, format string, upm PackageUIDM
 		OutputBuffer:      b,
 		IdxMap:            idxMap,
 		Errs:              errs,
-		Overflow:          overflow,
+		OverflowMs:        overflowMs,
 		TimeToDelta:       d.timeToDelta,
 	}
+}
+
+// extractLevel returns battery level events from the given history lines after an overflow event.
+func extractLevel(h []string, curMs int64, d *deltaMapping) ([]csv.Event, []error) {
+	var b bytes.Buffer
+	csvState := csv.NewState(&b, false)
+
+	ds := newDeviceState()
+	ds.CurrentTime = curMs
+
+	// We only want the generated CSV, so these are just dummy variables passed to analyzeHistoryLine.
+	as := newActivitySummary(FormatTotalTime)
+	var sums []ActivitySummary
+	pum := PackageUIDMapping{}
+
+	for _, l := range h {
+		// Ignore errors as most will be due to incomplete (non battery level) events.
+		// e.g. two negative transitions for "Temp White List
+		ds, _, _ = analyzeHistoryLine(ioutil.Discard, csvState, ds, as, &sums, nil, pum, d, l, true)
+	}
+	csvState.PrintAllReset(ds.CurrentTime)
+	es, errs := csv.ExtractEvents(b.String(), []string{BatteryLevel})
+	return es[BatteryLevel], errs
 }
 
 // fixTimeline processes the given history, tries to fix the time statements in the
@@ -2717,7 +3246,7 @@ func fixTimeline(h string) ([]string, bool, error) {
 		line := s[i]
 
 		if timeFound {
-			if StartRE.MatchString(line) || ShutdownRE.MatchString(line) || OverflowRE.MatchString(line) {
+			if StartRE.MatchString(line) || ShutdownRE.MatchString(line) {
 				// Seeing a START or SHUTDOWN means that the time we were using won't be valid for earlier statements
 				// so go back to looking for a new TIME statement to use.
 				timeFound = false
@@ -2761,17 +3290,17 @@ func fixTimeline(h string) ([]string, bool, error) {
 
 // PackageUIDMapping contains a series of mapping between package names and their UIDs.
 type PackageUIDMapping struct {
-	// UIDToPackage maps from UIDs to their containing packages.
+	// uidToPackage maps from UIDs to their containing packages.
 	// For shared UIDs, package names will be combined and delineated by ';'.
-	UIDToPackage map[int32]string
-	// PackageToUID maps from a package name to a UID.
+	uidToPackage map[int32]string
+	// packageToUID maps from a package name to a UID.
 	// The UID will be the appID as defined in packageutils.AppID()
-	PackageToUID map[string]int32
-	// SharedUIDName maps from a UID to the corresponding shared UID label.
+	packageToUID map[string]int32
+	// sharedUIDName maps from a UID to the corresponding shared UID label.
 	// The string will be the predefined name, if it exists, otherwise, the shared UID name.
-	SharedUIDName map[int32]string
-	// PkgList contains all of the packages parsed to generate the mappings.
-	PkgList []*usagepb.PackageInfo
+	sharedUIDName map[int32]string
+	// pkgList contains all of the packages parsed to generate the mappings.
+	pkgList []*usagepb.PackageInfo
 }
 
 // UIDAndPackageNameMapping builds a mapping of UIDs to package names and package names to UIDs.
@@ -2842,7 +3371,7 @@ func UIDAndPackageNameMapping(checkin string, pkgs []*usagepb.PackageInfo) (Pack
 }
 
 // matchServiceWithPackageInfo attempts to match the best usagepb.PackageInfo for the given ServiceUID.
-func (upm *PackageUIDMapping) matchServiceWithPackageInfo(suid *ServiceUID) error {
+func (pum *PackageUIDMapping) matchServiceWithPackageInfo(suid *ServiceUID) error {
 	// Check hard-coded UIDs first
 	uid, err := packageutils.AppIDFromString(suid.UID)
 	if err != nil {
@@ -2858,7 +3387,7 @@ func (upm *PackageUIDMapping) matchServiceWithPackageInfo(suid *ServiceUID) erro
 			}
 			return nil
 		}
-		if n, ok := upm.SharedUIDName[uid]; ok {
+		if n, ok := pum.sharedUIDName[uid]; ok {
 			suid.Pkg = &usagepb.PackageInfo{
 				PkgName: proto.String(n),
 				Uid:     proto.Int32(uid),
@@ -2868,7 +3397,7 @@ func (upm *PackageUIDMapping) matchServiceWithPackageInfo(suid *ServiceUID) erro
 	}
 
 	// See if simple matching works
-	pkg, err := packageutils.GuessPackage(suid.Service, suid.UID, upm.PkgList)
+	pkg, err := packageutils.GuessPackage(suid.Service, suid.UID, pum.pkgList)
 	if err != nil {
 		return err
 	}
@@ -2890,7 +3419,7 @@ func (upm *PackageUIDMapping) matchServiceWithPackageInfo(suid *ServiceUID) erro
 		}
 	}
 	// Holding off this check until now in case GuessPackage returns a better package.
-	if ps := upm.UIDToPackage[uid]; uid != 0 && strings.Contains(ps, ";") {
+	if ps := pum.uidToPackage[uid]; uid != 0 && strings.Contains(ps, ";") {
 		suid.Pkg = &usagepb.PackageInfo{
 			PkgName: proto.String(ps),
 			Uid:     proto.Int32(uid),
@@ -2907,8 +3436,8 @@ func (upm *PackageUIDMapping) matchServiceWithPackageInfo(suid *ServiceUID) erro
 	// share the UID, so if we did this in the opposite order, there is a chance we would match the
 	// service string to gsf instead of gms.
 	if pkg == nil || pkg.GetPkgName() == "android" {
-		if p, ok := upm.UIDToPackage[uid]; ok {
-			pkg, err = packageutils.GuessPackage(p, suid.UID, upm.PkgList)
+		if p, ok := pum.uidToPackage[uid]; ok {
+			pkg, err = packageutils.GuessPackage(p, suid.UID, pum.pkgList)
 			if err != nil {
 				return err
 			}
@@ -2920,8 +3449,8 @@ func (upm *PackageUIDMapping) matchServiceWithPackageInfo(suid *ServiceUID) erro
 			}
 		} else {
 			s := strings.Trim(suid.Service, `"`)
-			if u, ok := upm.PackageToUID[s]; ok {
-				pkg, err = packageutils.GuessPackage(s, fmt.Sprint(u), upm.PkgList)
+			if u, ok := pum.packageToUID[s]; ok {
+				pkg, err = packageutils.GuessPackage(s, fmt.Sprint(u), pum.pkgList)
 				if err != nil {
 					return err
 				}
@@ -2936,4 +3465,16 @@ func (upm *PackageUIDMapping) matchServiceWithPackageInfo(suid *ServiceUID) erro
 	}
 	suid.Pkg = pkg
 	return nil
+}
+
+// packageName attempts to get the best package name for the given UID.
+func (pum *PackageUIDMapping) packageName(uid int32) string {
+	// Check hard-coded UIDs first
+	if n, ok := checkinparse.KnownUIDs[uid]; ok {
+		return n
+	}
+	if n, ok := pum.sharedUIDName[uid]; ok {
+		return n
+	}
+	return pum.uidToPackage[uid]
 }
